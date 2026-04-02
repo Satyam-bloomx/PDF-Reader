@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python -c \"from app.extractor import extract_pdf; from app.renderer import build_html, render_pdf; print\\(''imports OK''\\)\")",
+      "Bash(py -c \"from app.extractor import extract_pdf; from app.renderer import build_html, render_pdf; print\\(''imports OK''\\)\")",
+      "Bash(py -c \":*)"
+    ],
+    "additionalDirectories": [
+      "d:\\antigravity\\PDF Reader"
+    ]
+  }
+}
