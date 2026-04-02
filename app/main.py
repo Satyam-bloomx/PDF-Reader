@@ -87,7 +87,7 @@ async def index():
       --panel: rgba(28,22,14,0.82);
     }
     html, body { height: 100%; overflow: hidden; background: var(--deep); color: var(--text); font-family: 'Space Grotesk', sans-serif; }
-    #bg-canvas { position: fixed; inset: 0; z-index: 0; }
+    #bg-canvas { position: fixed; inset: 0; z-index: 0; width: 100% !important; height: 100% !important; }
 
     #app { position: relative; z-index: 1; height: 100vh; display: flex; flex-direction: column; padding: 0 32px; }
 
@@ -201,6 +201,28 @@ async def index():
 
     @keyframes gold-pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 0.85; } }
     .pulse-ring { animation: gold-pulse 2.2s ease-in-out infinite; transform-origin: 300px 300px; }
+
+    /* ── Mobile responsive ── */
+    @media (max-width: 820px) {
+      html, body { height: auto; overflow: auto; }
+      #app { height: auto; min-height: 100dvh; padding: 0 16px 24px; }
+      main { flex-direction: column; gap: 20px; padding: 12px 0; align-items: center; }
+      .wheel-col { width: 100%; display: flex; justify-content: center; }
+      #zodiac-svg { width: min(92vw, 56vh); height: min(92vw, 56vh); }
+      .ctrl-col { flex: none; width: min(92vw, 420px); padding: 16px 14px; }
+      header { padding: 8px 0 6px; }
+      h1 { font-size: clamp(1.2rem, 5vw, 1.6rem); }
+      .eyebrow { font-size: 0.52rem; letter-spacing: 0.22em; }
+      .subtitle { font-size: 0.55rem; letter-spacing: 0.12em; }
+      #tip { display: none !important; }
+    }
+
+    @media (max-width: 420px) {
+      #zodiac-svg { width: 94vw; height: 94vw; }
+      .ctrl-col { width: 94vw; padding: 14px 12px; }
+      .sign-name { font-size: 0.95rem; }
+      .btn-main { font-size: 0.9rem; padding: 10px; }
+    }
   </style>
 </head>
 <body>
@@ -400,6 +422,9 @@ async def index():
     document.getElementById('fname').style.fontSize=(b*0.68)+'px';
   }
   sizeDZ();
+  // Re-run after fonts/layout settle on mobile
+  window.addEventListener('load', sizeDZ);
+  setTimeout(sizeDZ, 300);
 
   // ══════════════ SELECT SIGN ══════════════
   let activeIdx=-1;
