@@ -196,8 +196,10 @@ async def index():
 
     #tip { position: fixed; pointer-events: none; background: rgba(22,17,10,0.96); border: 1px solid rgba(184,146,74,0.28); border-radius: 8px; padding: 5px 12px; font-size: 0.68rem; font-family: 'Cormorant Garamond', serif; font-style: italic; color: var(--gold-lt); z-index: 999; display: none; white-space: nowrap; backdrop-filter: blur(10px); }
 
-    .seg { cursor: pointer; }
+    .seg { cursor: pointer; outline: none; -webkit-tap-highlight-color: transparent; }
     .seg:hover .sf { opacity: 0.14 !important; }
+    #zodiac-svg, #zodiac-svg * { -webkit-tap-highlight-color: transparent; outline: none; }
+    #drop-zone { -webkit-tap-highlight-color: transparent; outline: none; }
 
     @keyframes gold-pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 0.85; } }
     .pulse-ring { animation: gold-pulse 2.2s ease-in-out infinite; transform-origin: 300px 300px; }
@@ -382,6 +384,9 @@ async def index():
     const[dx,dy]=polar(RO-9,amid);
     g.appendChild(el('circle',{cx:dx,cy:dy,r:'2.8',fill:ec+'90',class:'dot'}));
 
+    g.style.webkitTapHighlightColor = 'transparent';
+    g.style.outline = 'none';
+    g.addEventListener('touchstart', e=>{ e.preventDefault(); selectSign(i); }, {passive:false});
     g.addEventListener('click',()=>selectSign(i));
     const tip=document.getElementById('tip');
     g.addEventListener('mousemove',e2=>{
