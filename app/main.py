@@ -13,13 +13,18 @@ import time
 import shutil
 import asyncio
 import traceback
+import tempfile
+import threading
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, HTMLResponse
+_recolor_lock = threading.Lock()
 
-from .recolor import recolor_pdf
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+import io
+
+from .recolor import _recolor_array, _set_palette
 
 async def cleanup_jobs():
     while True:
@@ -131,7 +136,13 @@ async def index():
     .dz-moon { color: var(--gold); filter: drop-shadow(0 0 8px rgba(184,146,74,0.4)); line-height: 1; }
     .dz-lbl { font-family: 'Cormorant Garamond', serif; color: var(--muted); font-style: italic; line-height: 1.2; }
     .dz-sub { color: rgba(200,182,148,0.32); letter-spacing: 0.04em; }
-    #fname { color: var(--gold-lt); max-width: 88%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 10px; display: none; }
+    #fname { color: #e8e8e8; max-width: 88%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 4px 10px; display: none; font-size: 0.78rem; text-align: center; }
+    #fname-badge { display: none; flex-direction: column; align-items: center; gap: 3px; }
+    #fname-badge .fname-check { color: #7dde82; font-size: 1.5em; line-height: 1; }
+    #fname-badge .fname-label { font-size: 0.58rem; color: #7dde82; text-transform: uppercase; letter-spacing: 0.14em; font-weight: 500; }
+    #fname-badge .fname-name { color: #e8e4d8; font-size: 0.7rem; max-width: 90%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; padding: 0 6px; }
+    #fname-badge .fname-reupload { font-size: 0.55rem; color: var(--muted); text-decoration: underline; cursor: pointer; margin-top: 2px; letter-spacing: 0.06em; }
+    #fname-badge .fname-reupload:hover { color: var(--gold-lt); }
 
     /* Controls panel — frosted parchment card */
     .ctrl-col {
@@ -205,31 +216,119 @@ async def index():
     .pulse-ring { animation: gold-pulse 2.2s ease-in-out infinite; transform-origin: 300px 300px; }
 
     /* ── Mobile responsive ── */
-    @media (max-width: 820px) {
+    @media (max-width: 1100px) {
+      .prev-col { flex: 0 0 260px; }
+      main { gap: 28px; }
+    }
+    @media (max-width: 860px) {
       html, body { height: auto; overflow: auto; }
       #app { height: auto; min-height: 100dvh; padding: 0 16px 24px; }
       main { flex-direction: column; gap: 20px; padding: 12px 0; align-items: center; }
       .wheel-col { width: 100%; display: flex; justify-content: center; }
       #zodiac-svg { width: min(92vw, 56vh); height: min(92vw, 56vh); }
       .ctrl-col { flex: none; width: min(92vw, 420px); padding: 16px 14px; }
+      .prev-col { flex: none; width: min(92vw, 420px); min-height: 420px; align-self: auto; padding: 16px 14px; }
       header { padding: 8px 0 6px; }
       h1 { font-size: clamp(1.2rem, 5vw, 1.6rem); }
       .eyebrow { font-size: 0.52rem; letter-spacing: 0.22em; }
       .subtitle { font-size: 0.55rem; letter-spacing: 0.12em; }
       #tip { display: none !important; }
     }
-
     @media (max-width: 420px) {
       #zodiac-svg { width: 94vw; height: 94vw; }
-      .ctrl-col { width: 94vw; padding: 14px 12px; }
-      .sign-name { font-size: 0.95rem; }
+      .ctrl-col, .prev-col { width: 94vw; padding: 14px 12px; }
       .btn-main { font-size: 0.9rem; padding: 10px; }
+    }
+
+    /* Preview panel */
+    .prev-col {
+      flex: 0 0 320px; display: flex; flex-direction: column; gap: 10px;
+      align-self: stretch;
+      background: var(--panel);
+      backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+      border: 1px solid rgba(184,146,74,0.2);
+      border-radius: 20px; padding: 16px 14px;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.35), inset 0 1px 0 rgba(230,215,188,0.06);
+    }
+    .prev-col-header {
+      display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+    }
+    .prev-col-title {
+      font-size: 0.56rem; letter-spacing: 0.24em; text-transform: uppercase; color: var(--gold); opacity: 0.7;
+      display: flex; align-items: center; gap: 8px; flex: 1;
+    }
+    .prev-col-title::after { content: ''; flex: 1; height: 1px; background: rgba(184,146,74,0.18); }
+    #prev-expand-btn {
+      background: none; border: 1px solid rgba(184,146,74,0.18); color: var(--muted);
+      border-radius: 7px; width: 28px; height: 28px; cursor: pointer; font-size: 0.85rem;
+      display: none; align-items: center; justify-content: center; flex-shrink: 0; margin-left: 8px;
+      transition: border-color 0.2s, color 0.2s;
+    }
+    #prev-expand-btn.visible { display: flex; }
+    #prev-expand-btn:hover { border-color: var(--gold); color: var(--gold); }
+    #prev-panel {
+      flex: 1; min-height: 0; border-radius: 12px;
+      border: 1px solid rgba(184,146,74,0.14); background: rgba(0,0,0,0.35);
+      overflow: auto; display: flex; align-items: flex-start; justify-content: center;
+      position: relative; cursor: default;
+    }
+    #prev-panel.has-img { cursor: zoom-in; }
+    #prev-img { width: 100%; height: auto; display: none; border-radius: 6px; pointer-events: none; }
+    #prev-placeholder {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 10px; padding: 30px; text-align: center; color: var(--muted);
+      position: absolute; inset: 0;
+    }
+    .prev-ph-icon { font-size: 2.8rem; opacity: 0.2; }
+    .prev-ph-txt { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 0.88rem; opacity: 0.45; line-height: 1.5; max-width: 220px; }
+    #prev-spinner-wrap {
+      position: absolute; inset: 0; display: none;
+      background: rgba(10,8,4,0.65); align-items: center; justify-content: center;
+      flex-direction: column; gap: 12px; border-radius: 12px; backdrop-filter: blur(4px);
+    }
+    #prev-spinner-wrap.active { display: flex; }
+    .prev-spin { width: 32px; height: 32px; border: 2px solid rgba(184,146,74,0.15); border-top-color: var(--gold); border-radius: 50%; animation: spin 0.85s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .prev-spin-txt { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 0.8rem; color: var(--muted); }
+    #prev-err-txt { color: #e08080; font-size: 0.74rem; padding: 16px; text-align: center; display: none; line-height: 1.5; position: absolute; }
+    .prev-footer { display: flex; gap: 8px; flex-shrink: 0; }
+    #preview-btn {
+      flex: 1;
+      background: linear-gradient(135deg, rgba(80,120,184,0.18), rgba(60,90,160,0.08));
+      border: 1px solid rgba(100,140,220,0.32); color: #88b4ff; border-radius: 10px; padding: 9px;
+      font-family: 'Cormorant Garamond', serif; font-size: 0.82rem; font-weight: 600;
+      letter-spacing: 0.1em; cursor: pointer; transition: all 0.25s; text-transform: uppercase;
+    }
+    #preview-btn:hover:not(:disabled) { background: linear-gradient(135deg, rgba(80,120,184,0.32), rgba(60,90,160,0.18)); border-color: #88b4ff; box-shadow: 0 0 14px rgba(100,140,220,0.2); }
+    #preview-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+    /* Fullscreen lightbox */
+    #lightbox {
+      position: fixed; inset: 0; z-index: 600; display: none;
+      background: rgba(8,6,3,0.96); backdrop-filter: blur(16px);
+      align-items: center; justify-content: center; padding: 20px;
+      cursor: zoom-out;
+    }
+    #lightbox.open { display: flex; }
+    #lightbox-img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 8px; box-shadow: 0 0 80px rgba(184,146,74,0.12); pointer-events: none; }
+    #lightbox-close {
+      position: absolute; top: 16px; right: 16px;
+      background: rgba(28,22,14,0.9); border: 1px solid rgba(184,146,74,0.28); color: var(--gold-lt);
+      border-radius: 10px; width: 40px; height: 40px; cursor: pointer; font-size: 1.1rem;
+      display: flex; align-items: center; justify-content: center; transition: all 0.2s; z-index: 1;
+    }
+    #lightbox-close:hover { border-color: var(--gold); box-shadow: 0 0 16px rgba(184,146,74,0.2); }
+    #lightbox-hint {
+      position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+      font-size: 0.62rem; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted);
+      opacity: 0.45; pointer-events: none;
     }
   </style>
 </head>
 <body>
   <canvas id="bg-canvas"></canvas>
   <div id="tip"></div>
+
 
   <div id="app">
     <header>
@@ -246,7 +345,12 @@ async def index():
           <div class="dz-moon">&#x263D;</div>
           <div class="dz-lbl">Drop PDF here</div>
           <div class="dz-sub">or click to browse</div>
-          <div id="fname"></div>
+          <div id="fname-badge">
+            <div class="fname-check">&#x2714;</div>
+            <div class="fname-label">PDF Loaded</div>
+            <div class="fname-name" id="fname"></div>
+            <div class="fname-reupload" onclick="fi.click()">&#x21BA; reupload</div>
+          </div>
         </div>
       </div>
 
@@ -275,6 +379,13 @@ async def index():
               <input type="text" id="text-hex" class="hex-in" value="#D1D5DB" maxlength="7">
             </div>
           </div>
+          <div class="color-row">
+            <span class="color-lbl" title="Color for bold/highlighted text (dates, headings, planet names)">Bold Text</span>
+            <div class="color-grp">
+              <input type="color" id="gold-color" value="#ffd85a">
+              <input type="text" id="gold-hex" class="hex-in" value="#FFD85A" maxlength="7">
+            </div>
+          </div>
           <div class="op-wrap">
             <div class="op-lbl"><span>Opacity</span><span id="op-val">100%</span></div>
             <input type="range" id="bg-op" min="0" max="100" value="100">
@@ -283,7 +394,6 @@ async def index():
         </div>
 
         <div style="display:none">
-          <input type="color" id="gold-color" value="#ffd85a">
           <input type="color" id="violet-color" value="#ffb266">
           <input type="color" id="teal-color" value="#ffe699">
           <input type="color" id="coral-color" value="#ffc794">
@@ -293,24 +403,54 @@ async def index():
         <div id="status"></div>
         <button id="dl-btn" onclick="downloadFile()">&#x2B07; &nbsp; Download Beautified PDF</button>
       </div>
+
+      <!-- Live preview panel -->
+      <div class="prev-col">
+        <div class="prev-col-header">
+          <div class="prev-col-title">&#x2606; Live Preview</div>
+          <button id="prev-expand-btn" title="Full screen" onclick="openLightbox()">&#x26F6;</button>
+        </div>
+        <div id="prev-panel" onclick="openLightbox()">
+          <div id="prev-placeholder">
+            <div class="prev-ph-icon">&#x1F4C4;</div>
+            <div class="prev-ph-txt">Upload a PDF &amp; select a sign to preview page 1</div>
+          </div>
+          <img id="prev-img" alt="Preview of page 1">
+          <div id="prev-spinner-wrap">
+            <div class="prev-spin"></div>
+            <div class="prev-spin-txt">Casting the celestial spell&#x2026;</div>
+          </div>
+          <div id="prev-err-txt"></div>
+        </div>
+        <div class="prev-footer">
+          <button id="preview-btn" onclick="requestPreview()" disabled>&#x21BA; &nbsp; Refresh Preview</button>
+        </div>
+      </div>
     </main>
+
+    <!-- Fullscreen lightbox -->
+    <div id="lightbox" onclick="closeLightbox()">
+      <button id="lightbox-close" onclick="closeLightbox()">&#x2715;</button>
+      <img id="lightbox-img" alt="Full size preview">
+      <div id="lightbox-hint">Click anywhere to close &nbsp;&middot;&nbsp; Esc</div>
+    </div>
   </div>
 
   <script>
   // ══════════════ ZODIAC DATA ══════════════
   const SIGNS = [
-    {name:'Aries',       sym:'\u2648', bg:'#1a0500', text:'#ff9966', el:'Fire',  dates:'Mar 21 \u2013 Apr 19'},
-    {name:'Taurus',      sym:'\u2649', bg:'#0a1a0a', text:'#88d488', el:'Earth', dates:'Apr 20 \u2013 May 20'},
-    {name:'Gemini',      sym:'\u264A', bg:'#04101f', text:'#88ccff', el:'Air',   dates:'May 21 \u2013 Jun 20'},
-    {name:'Cancer',      sym:'\u264B', bg:'#0d1b2a', text:'#c8d8f0', el:'Water', dates:'Jun 21 \u2013 Jul 22'},
-    {name:'Leo',         sym:'\u264C', bg:'#1c0f00', text:'#ffd700', el:'Fire',  dates:'Jul 23 \u2013 Aug 22'},
-    {name:'Virgo',       sym:'\u264D', bg:'#f0ece0', text:'#2c1a0e', el:'Earth', dates:'Aug 23 \u2013 Sep 22'},
-    {name:'Libra',       sym:'\u264E', bg:'#180a14', text:'#ffaac8', el:'Air',   dates:'Sep 23 \u2013 Oct 22'},
-    {name:'Scorpio',     sym:'\u264F', bg:'#0b0018', text:'#b080ff', el:'Water', dates:'Oct 23 \u2013 Nov 21'},
-    {name:'Sagittarius', sym:'\u2650', bg:'#100a00', text:'#ffcc66', el:'Fire',  dates:'Nov 22 \u2013 Dec 21'},
-    {name:'Capricorn',   sym:'\u2651', bg:'#080808', text:'#b0b0c0', el:'Earth', dates:'Dec 22 \u2013 Jan 19'},
-    {name:'Aquarius',    sym:'\u2652', bg:'#030c18', text:'#00d4ff', el:'Air',   dates:'Jan 20 \u2013 Feb 18'},
-    {name:'Pisces',      sym:'\u2653', bg:'#04081a', text:'#66b8dd', el:'Water', dates:'Feb 19 \u2013 Mar 20'},
+    {name:'Aries',       sym:'\u2648', bg:'#1a0500', text:'#ff9966', accent:'#ffd85a', el:'Fire',  dates:'Mar 21 \u2013 Apr 19'},
+    {name:'Taurus',      sym:'\u2649', bg:'#0a1a0a', text:'#88d488', accent:'#c8f0a0', el:'Earth', dates:'Apr 20 \u2013 May 20'},
+    {name:'Gemini',      sym:'\u264A', bg:'#04101f', text:'#88ccff', accent:'#ffe08a', el:'Air',   dates:'May 21 \u2013 Jun 20'},
+    {name:'Cancer',      sym:'\u264B', bg:'#0d1b2a', text:'#c8d8f0', accent:'#d0c0ff', el:'Water', dates:'Jun 21 \u2013 Jul 22'},
+    {name:'Leo',         sym:'\u264C', bg:'#1c0f00', text:'#ffd700', accent:'#ff9944', el:'Fire',  dates:'Jul 23 \u2013 Aug 22'},
+    {name:'Virgo',       sym:'\u264D', bg:'#f0ece0', text:'#2c1a0e', accent:'#b05010', el:'Earth', dates:'Aug 23 \u2013 Sep 22'},
+    {name:'Libra',       sym:'\u264E', bg:'#180a14', text:'#ffaac8', accent:'#ffdd88', el:'Air',   dates:'Sep 23 \u2013 Oct 22'},
+    {name:'Scorpio',     sym:'\u264F', bg:'#0b0018', text:'#b080ff', accent:'#ff6688', el:'Water', dates:'Oct 23 \u2013 Nov 21'},
+    {name:'Sagittarius', sym:'\u2650', bg:'#100a00', text:'#ffcc66', accent:'#ff8844', el:'Fire',  dates:'Nov 22 \u2013 Dec 21'},
+    {name:'Capricorn',   sym:'\u2651', bg:'#080808', text:'#b0b0c0', accent:'#88aacc', el:'Earth', dates:'Dec 22 \u2013 Jan 19'},
+    {name:'Aquarius',    sym:'\u2652', bg:'#030c18', text:'#00d4ff', accent:'#88eeff', el:'Air',   dates:'Jan 20 \u2013 Feb 18'},
+    {name:'Pisces',      sym:'\u2653', bg:'#04081a', text:'#66b8dd', accent:'#aa88ff', el:'Water', dates:'Feb 19 \u2013 Mar 20'},
   ];
   const EC = {Fire:'#e8622a', Earth:'#5a9e48', Air:'#3aa8d8', Water:'#4060cc'};
 
@@ -424,7 +564,9 @@ async def index():
     dz.querySelector('.dz-moon').style.fontSize=(b*1.9)+'px';
     dz.querySelector('.dz-lbl').style.fontSize=(b*0.95)+'px';
     dz.querySelector('.dz-sub').style.fontSize=(b*0.68)+'px';
-    document.getElementById('fname').style.fontSize=(b*0.68)+'px';
+    document.getElementById('fname').style.fontSize=(b*0.62)+'px';
+    const chk=document.querySelector('.fname-check'); if(chk) chk.style.fontSize=(b*1.3)+'px';
+    const lbl=document.querySelector('.fname-label'); if(lbl) lbl.style.fontSize=(b*0.55)+'px';
   }
   sizeDZ();
   // Re-run after fonts/layout settle on mobile
@@ -462,8 +604,10 @@ async def index():
     document.getElementById('text-color').value=s.text;
     document.getElementById('bg-hex').value=s.bg.toUpperCase();
     document.getElementById('text-hex').value=s.text.toUpperCase();
+    document.getElementById('gold-color').value=s.accent;
+    document.getElementById('gold-hex').value=s.accent.toUpperCase();
     document.getElementById('bg-op').value=100;
-    syncA(); updatePrev();
+    syncA(); updatePrev(); schedulePreview();
   }
 
   // ══════════════ COLORS ══════════════
@@ -479,21 +623,28 @@ async def index():
     document.getElementById('preview').style.color=txPk.value;
     document.getElementById('op-val').textContent=document.getElementById('bg-op').value+'%';
   }
+  const acPk=document.getElementById('gold-color');
+
   function syncA(){
     const v=txPk.value;
-    ['gold-color','violet-color','teal-color','coral-color'].forEach(id=>document.getElementById(id).value=v);
+    ['violet-color','teal-color','coral-color'].forEach(id=>document.getElementById(id).value=v);
     updatePrev();
   }
 
-  bgPk.addEventListener('input',()=>{document.getElementById('bg-hex').value=bgPk.value.toUpperCase();updatePrev();});
+  bgPk.addEventListener('input',()=>{document.getElementById('bg-hex').value=bgPk.value.toUpperCase();updatePrev();schedulePreview();});
   document.getElementById('bg-hex').addEventListener('input',e=>{
     const v=e.target.value.startsWith('#')?e.target.value:'#'+e.target.value;
-    if(vHex(v)){bgPk.value=v;updatePrev();}
+    if(vHex(v)){bgPk.value=v;updatePrev();schedulePreview();}
   });
-  txPk.addEventListener('input',()=>{document.getElementById('text-hex').value=txPk.value.toUpperCase();syncA();});
+  txPk.addEventListener('input',()=>{document.getElementById('text-hex').value=txPk.value.toUpperCase();syncA();schedulePreview();});
   document.getElementById('text-hex').addEventListener('input',e=>{
     const v=e.target.value.startsWith('#')?e.target.value:'#'+e.target.value;
     if(vHex(v)){txPk.value=v;syncA();}
+  });
+  acPk.addEventListener('input',()=>{document.getElementById('gold-hex').value=acPk.value.toUpperCase();schedulePreview();});
+  document.getElementById('gold-hex').addEventListener('input',e=>{
+    const v=e.target.value.startsWith('#')?e.target.value:'#'+e.target.value;
+    if(vHex(v)){acPk.value=v;schedulePreview();}
   });
   document.getElementById('bg-op').addEventListener('input',updatePrev);
 
@@ -514,13 +665,89 @@ async def index():
 
   function handleFile(){
     const f=fi.files[0]; if(!f) return;
-    const fd=document.getElementById('fname');
-    fd.textContent='&#128206; '+f.name; fd.style.display='block';
+    document.getElementById('fname').textContent=f.name;
+    const badge=document.getElementById('fname-badge');
+    badge.style.display='flex';
     dz.querySelector('.dz-moon').style.display='none';
     dz.querySelector('.dz-lbl').style.display='none';
     dz.querySelector('.dz-sub').style.display='none';
     bBtn.disabled=false;
+    document.getElementById('preview-btn').disabled=false;
+    requestPreview();
   }
+
+  // ══════════════ LIVE PREVIEW ══════════════
+  let prevDebounce=null;
+  function schedulePreview(){
+    // Re-trigger preview when colors change (if file already loaded)
+    if(!fi.files[0]) return;
+    clearTimeout(prevDebounce);
+    prevDebounce=setTimeout(requestPreview, 600);
+  }
+
+  async function requestPreview(){
+    const f=fi.files[0]; if(!f) return;
+    const pb=document.getElementById('preview-btn');
+    const sw=document.getElementById('prev-spinner-wrap');
+    const img=document.getElementById('prev-img');
+    const errTxt=document.getElementById('prev-err-txt');
+    const ph=document.getElementById('prev-placeholder');
+    const panel=document.getElementById('prev-panel');
+    const expBtn=document.getElementById('prev-expand-btn');
+
+    pb.disabled=true;
+    sw.classList.add('active');
+    errTxt.style.display='none';
+    ph.style.display='none';
+
+    const fd=new FormData();
+    fd.append('file',f);
+    fd.append('bg_color',applyOp(bgPk.value,parseInt(document.getElementById('bg-op').value)));
+    fd.append('text_color',txPk.value);
+    ['gold','violet','teal','coral'].forEach(n=>fd.append(n+'_color',document.getElementById(n+'-color').value));
+    try{
+      const r=await fetch('/preview',{method:'POST',body:fd});
+      if(!r.ok){
+        const d=await r.json().catch(()=>({}));
+        throw new Error(d.detail||'Preview failed');
+      }
+      const blob=await r.blob();
+      const oldUrl=img.src;
+      const url=URL.createObjectURL(blob);
+      img.onload=()=>{
+        sw.classList.remove('active');
+        img.style.display='block';
+        panel.classList.add('has-img');
+        expBtn.classList.add('visible');
+        if(oldUrl.startsWith('blob:')) URL.revokeObjectURL(oldUrl);
+        // Also update lightbox src
+        document.getElementById('lightbox-img').src=url;
+      };
+      img.src=url;
+    }catch(err){
+      sw.classList.remove('active');
+      img.style.display='none';
+      panel.classList.remove('has-img');
+      expBtn.classList.remove('visible');
+      errTxt.textContent='\u2715 '+err.message;
+      errTxt.style.display='block';
+    }finally{
+      pb.disabled=false;
+    }
+  }
+
+  // ══════════════ LIGHTBOX ══════════════
+  function openLightbox(){
+    const src=document.getElementById('prev-img').src;
+    if(!src||!src.startsWith('blob:')) return;
+    document.getElementById('lightbox').classList.add('open');
+    document.body.style.overflow='hidden';
+  }
+  function closeLightbox(){
+    document.getElementById('lightbox').classList.remove('open');
+    document.body.style.overflow='';
+  }
+  document.addEventListener('keydown',e=>{if(e.key==='Escape') closeLightbox();});
 
   async function uploadFile(){
     const f=fi.files[0]; if(!f) return;
@@ -665,6 +892,82 @@ async def index():
 </html>"""
 
 
+@app.post("/preview")
+async def preview_pdf(
+    file: UploadFile = File(...),
+    bg_color: str = Form("#0b0d17"),
+    text_color: str = Form("#d1d5db"),
+    gold_color: str = Form("#ffd85a"),
+    violet_color: str = Form("#ffb266"),
+    teal_color: str = Form("#ffe699"),
+    coral_color: str = Form("#ffc794"),
+):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+
+    palette = {
+        "bg":     hex_to_rgb(bg_color),
+        "text":   hex_to_rgb(text_color),
+        "gold":   hex_to_rgb(gold_color),
+        "violet": hex_to_rgb(violet_color),
+        "teal":   hex_to_rgb(teal_color),
+        "coral":  hex_to_rgb(coral_color),
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        input_path = os.path.join(tmp, "input.pdf")
+
+        with open(input_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+        try:
+            loop = asyncio.get_running_loop()
+            png_bytes = await loop.run_in_executor(
+                None, _render_preview_page, input_path, palette
+            )
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Preview failed: {e}")
+
+    return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
+
+
+def _render_preview_page(input_path: str, palette: dict) -> bytes:
+    """
+    Preview strategy: render the ORIGINAL PDF page with PyMuPDF (same engine as
+    Chrome — correct fonts, transparency, borders), then apply the palette color
+    transformation on the raw pixels using _recolor_array.
+    Fast (~1-2s), no pikepdf stream manipulation, visually identical to final output.
+    """
+    import fitz
+    import numpy as np
+    from PIL import Image
+    import io as _io
+
+    # 1. Render original page at 180 DPI — PyMuPDF reads it correctly like Chrome
+    doc = fitz.open(input_path)
+    page = doc[0]
+    mat = fitz.Matrix(180 / 72, 180 / 72)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    doc.close()
+
+    # 2. Convert pixmap → float32 numpy array [0..1]
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+    arr = arr.astype(np.float32) / 255.0
+
+    # 3. Apply the exact same palette color mapping used on embedded images
+    with _recolor_lock:
+        _set_palette(palette)
+        recolored = _recolor_array(arr)
+
+    # 4. Encode result as PNG
+    out_arr = (np.clip(recolored, 0, 1) * 255).astype(np.uint8)
+    img = Image.fromarray(out_arr, "RGB")
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG", optimize=False)
+    return buf.getvalue()
+
+
 @app.post("/upload")
 async def upload_pdf(
     background_tasks: BackgroundTasks,
@@ -719,9 +1022,49 @@ async def _process_pdf(job_id: str, input_path: str, output_path: str, original_
 
 
 def _process_pdf_sync(input_path: str, output_path: str, original_filename: str, palette: dict):
-    print(f"[DEBUG] recoloring {original_filename} via pikepdf")
-    recolor_pdf(input_path, output_path, palette)
-    print("[DEBUG] done")
+    """
+    Render every page with PyMuPDF (same engine as preview), apply _recolor_array
+    pixel-by-pixel, then pack back into a PDF.  This guarantees the downloaded PDF
+    looks identical to the Live Preview — bold/accent-coloured text included.
+    """
+    import fitz
+    import numpy as np
+    from PIL import Image
+    import io as _io
+
+    print(f"[DEBUG] recoloring {original_filename} via PyMuPDF pixel render")
+
+    DPI = 160
+
+    src = fitz.open(input_path)
+    out_doc = fitz.open()
+
+    with _recolor_lock:
+        _set_palette(palette)
+        for page_num in range(len(src)):
+            page = src[page_num]
+            mat = fitz.Matrix(DPI / 72, DPI / 72)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+
+            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+            arr = arr.astype(np.float32) / 255.0
+            recolored = _recolor_array(arr)
+            out_arr = (np.clip(recolored, 0, 1) * 255).astype(np.uint8)
+
+            img = Image.fromarray(out_arr, "RGB")
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=90)
+            buf.seek(0)
+            jpeg_bytes = buf.read()
+
+            # Page dimensions in PDF points (1 point = 1/72 inch)
+            new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
+            new_page.insert_image(new_page.rect, stream=jpeg_bytes)
+
+    src.close()
+    out_doc.save(output_path, deflate=True)
+    out_doc.close()
+    print(f"[DEBUG] done — {len(src.pages) if not src.is_closed else '?'} pages")
 
 
 @app.get("/status/{job_id}")

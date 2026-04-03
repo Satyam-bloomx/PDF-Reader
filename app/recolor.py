@@ -54,8 +54,29 @@ def _map_rgb(r: float, g: float, b: float, for_text: bool = False,
     lum = 0.299 * r + 0.587 * g + 0.114 * b
     sat = (mx - mn) / (mx + 1e-6)
 
-    # ── Text block or stroke: render as TEXT color ────────────────────────
-    if for_text or for_stroke:
+    # ── Stroke (lines/borders): always TEXT color ─────────────────────────
+    if for_stroke:
+        return TEXT
+
+    # ── Text block: vivid colored text (e.g. red dates/headers) → accent ──
+    if for_text:
+        if sat >= 0.35:
+            delta = mx - mn + 1e-6
+            if mx == r:
+                hue = ((g - b) / delta) % 6
+            elif mx == g:
+                hue = (b - r) / delta + 2
+            else:
+                hue = (r - g) / delta + 4
+            hue /= 6.0
+            if hue < 0.18 or hue > 0.88:
+                return GOLD
+            elif 0.18 <= hue < 0.55:
+                return TEAL
+            elif 0.55 <= hue <= 0.85:
+                return VIOLET
+            else:
+                return CORAL
         return TEXT
 
     if sat < 0.4:
@@ -359,18 +380,19 @@ def add_background_rect(page: pikepdf.Page, pdf: pikepdf.Pdf) -> None:
         page.obj["/Contents"] = Array([bg_obj, existing])
 
 
-def recolor_pdf(input_path: str, output_path: str, palette: dict = None) -> None:
+def recolor_pdf(input_path: str, output_path: str, palette: dict = None, max_pages: int = None) -> None:
     """
     Open a PDF, recolor every page at vector level, write output.
-    Preserves all text as vectors — no rasterization.
     palette: optional dict with keys bg, text, gold, violet, teal, coral → (r,g,b) tuples
+    max_pages: if set, only recolor the first N pages (useful for preview).
     """
     if palette:
         _set_palette(palette)
 
     with pikepdf.open(input_path) as pdf:
         visited_xobjs: set = set()
-        for page in pdf.pages:
+        pages = list(pdf.pages)[:max_pages] if max_pages else pdf.pages
+        for page in pages:
             try:
                 recolor_page_stream(page, pdf, visited_xobjs)
             except Exception as e:
