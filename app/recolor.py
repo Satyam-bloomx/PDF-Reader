@@ -258,8 +258,13 @@ def _recolor_image_xobj(xobj: pikepdf.Object) -> None:
     new_data = buf.read()
 
     xobj.write(new_data, filter=pikepdf.Name("/DCTDecode"))
+    for key in ["/DecodeParms", "/SMask", "/Mask", "/ColorSpace"]:
+        if key in xobj:
+            del xobj[key]
     xobj["/ColorSpace"] = pikepdf.Name("/DeviceRGB")
     xobj["/BitsPerComponent"] = 8
+    xobj["/Width"] = out_img.width
+    xobj["/Height"] = out_img.height
 
 
 def _recolor_xobjects(resources: pikepdf.Object, _pdf: pikepdf.Pdf, visited: set) -> None:
@@ -321,67 +326,36 @@ def recolor_page_stream(page: pikepdf.Page, pdf: pikepdf.Pdf, visited_xobjs: set
         elif op == b"ET":
             in_text = False
 
-        # sc / scn — fill color in current colorspace
-        elif op in (b"sc", b"scn"):
-            nums = [v for v in operands if isinstance(v, (int, float)) or
-                    (hasattr(v, '__float__') and not hasattr(v, 'keys'))]
-            try:
-                nums = [float(v) for v in nums]
-            except Exception:
-                instructions.append((operands, operator))
-                continue
-            is_stroke_op = False
-            if len(nums) == 1:
-                mapped = _map_rgb(nums[0], nums[0], nums[0], for_text=in_text, for_stroke=is_stroke_op)
-            elif len(nums) == 3:
-                mapped = _map_rgb(nums[0], nums[1], nums[2], for_text=in_text, for_stroke=is_stroke_op)
-            elif len(nums) == 4:
-                c, m, y, k = nums
-                mapped = _map_rgb((1-c)*(1-k), (1-m)*(1-k), (1-y)*(1-k), for_text=in_text, for_stroke=is_stroke_op)
+        if op in _COLOR_OPS or op in (b"sc", b"scn", b"SC", b"SCN"):
+            if op in (b"sc", b"scn", b"SC", b"SCN"):
+                n = len(operands)
+                if n > 0 and isinstance(operands[-1], pikepdf.Name):
+                    instructions.append((operands, operator))
+                    continue
+                if n in (1, 3, 4):
+                    is_stroke = op in (b"SC", b"SCN")
+                    new_operands = _remap_color_args(list(operands), n, for_text=in_text, for_stroke=(is_stroke and not in_text))
+                    if len(new_operands) == 3 and n in (1, 4):
+                        new_op = pikepdf.Operator("rg") if not is_stroke else pikepdf.Operator("RG")
+                        instructions.append((new_operands, new_op))
+                    else:
+                        instructions.append((new_operands, operator))
+                else:
+                    instructions.append((operands, operator))
             else:
-                instructions.append((operands, operator))
-                continue
-            new_ops = [_to_pdf_num(v) for v in mapped]
-            instructions.append((new_ops, pikepdf.Operator("rg")))
-            continue
-
-        # SC / SCN — stroke color in current colorspace
-        elif op in (b"SC", b"SCN"):
-            nums = [v for v in operands if isinstance(v, (int, float)) or
-                    (hasattr(v, '__float__') and not hasattr(v, 'keys'))]
-            try:
-                nums = [float(v) for v in nums]
-            except Exception:
-                instructions.append((operands, operator))
-                continue
-            if len(nums) == 1:
-                mapped = _map_rgb(nums[0], nums[0], nums[0], for_stroke=True)
-            elif len(nums) == 3:
-                mapped = _map_rgb(nums[0], nums[1], nums[2], for_stroke=True)
-            elif len(nums) == 4:
-                c, m, y, k = nums
-                mapped = _map_rgb((1-c)*(1-k), (1-m)*(1-k), (1-y)*(1-k), for_stroke=True)
-            else:
-                instructions.append((operands, operator))
-                continue
-            new_ops = [_to_pdf_num(v) for v in mapped]
-            instructions.append((new_ops, pikepdf.Operator("RG")))
-            continue
-
-        if op in _COLOR_OPS:
-            n, is_cmyk, is_stroke = _COLOR_OPS[op]
-            new_operands = _remap_color_args(list(operands), n,
-                                             for_text=in_text,
-                                             for_stroke=(is_stroke and not in_text))
-            needs_rgb = (in_text or (is_stroke and not in_text)) and op in (b"g", b"G")
-            if needs_rgb and len(new_operands) == 3:
-                new_op = pikepdf.Operator("rg") if op == b"g" else pikepdf.Operator("RG")
-                instructions.append((new_operands, new_op))
-            elif is_cmyk:
-                new_op = pikepdf.Operator("rg") if op == b"k" else pikepdf.Operator("RG")
-                instructions.append((new_operands, new_op))
-            else:
-                instructions.append((new_operands, operator))
+                n, is_cmyk, is_stroke = _COLOR_OPS[op]
+                new_operands = _remap_color_args(list(operands), n,
+                                                 for_text=in_text,
+                                                 for_stroke=(is_stroke and not in_text))
+                needs_rgb = (in_text or (is_stroke and not in_text)) and op in (b"g", b"G")
+                if needs_rgb and len(new_operands) == 3:
+                    new_op = pikepdf.Operator("rg") if op == b"g" else pikepdf.Operator("RG")
+                    instructions.append((new_operands, new_op))
+                elif is_cmyk:
+                    new_op = pikepdf.Operator("rg") if op == b"k" else pikepdf.Operator("RG")
+                    instructions.append((new_operands, new_op))
+                else:
+                    instructions.append((new_operands, operator))
         else:
             instructions.append((operands, operator))
 
@@ -392,9 +366,8 @@ def recolor_page_stream(page: pikepdf.Page, pdf: pikepdf.Pdf, visited_xobjs: set
 
     # Two separate stream objects in an Array — PDF spec §7.8.3
     # This is the correct way to prepend content; all compliant viewers support it
-    bg_obj = pdf.make_stream(bg_bytes)
-    content_obj = pdf.make_stream(recolored_bytes)
-    page.obj["/Contents"] = Array([bg_obj, content_obj])
+    combined_bytes = bg_bytes + recolored_bytes
+    page.obj["/Contents"] = pdf.make_stream(combined_bytes)
 
 
 def add_background_rect(page: pikepdf.Page, pdf: pikepdf.Pdf) -> None:

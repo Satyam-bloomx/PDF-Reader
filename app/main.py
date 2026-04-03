@@ -26,25 +26,41 @@ import io
 
 from .recolor import _recolor_array, _set_palette
 
+BASE_DIR = Path(__file__).parent.parent
+UPLOAD_DIR = BASE_DIR / "uploads"
+OUTPUT_DIR = BASE_DIR / "outputs"
+UPLOAD_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+
 async def cleanup_jobs():
     while True:
         try:
             now = time.time()
+            
+            # 1. Clear the dictionary for memory safety
             keys_to_delete = []
             for jid, job in list(jobs.items()):
                 if now - job.get("timestamp", now) > 3600:
                     keys_to_delete.append(jid)
-                    if "input" in job and os.path.exists(job["input"]):
-                        try: os.remove(job["input"])
-                        except: pass
-                    if "output" in job and os.path.exists(job["output"]):
-                        try: os.remove(job["output"])
-                        except: pass
             for jid in keys_to_delete:
                 del jobs[jid]
+
+            # 2. Sweep the actual folders for orphaned files
+            for directory in [UPLOAD_DIR, OUTPUT_DIR]:
+                if not directory.exists(): continue
+                for item in directory.iterdir():
+                    if item.is_file():
+                        # If file was modified more than 1 hour ago, delete it
+                        if now - item.stat().st_mtime > 3600:
+                            try: 
+                                item.unlink()
+                                print(f"[cleanup] Deleted orphan: {item.name}")
+                            except Exception as e: 
+                                print(f"[cleanup] Failed to delete {item.name}: {e}")
+
         except Exception as e:
             print(f"[cleanup] error: {e}")
-        await asyncio.sleep(600)  # every 10 min
+        await asyncio.sleep(600)  # run every 10 min
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -54,11 +70,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="PDF Beautifier", lifespan=lifespan)
 
-BASE_DIR = Path(__file__).parent.parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-OUTPUT_DIR = BASE_DIR / "outputs"
-UPLOAD_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
+
 
 jobs: dict = {}
 
@@ -953,7 +965,7 @@ async def preview_pdf(
         "coral":  hex_to_rgb(coral_color),
     }
 
-    render_fn = _render_preview_page
+    render_fn = _render_preview_page if mode != "small" else _render_preview_page_small
 
     with tempfile.TemporaryDirectory() as tmp:
         input_path = os.path.join(tmp, "input.pdf")
@@ -1106,11 +1118,18 @@ def _process_pdf_sync(input_path: str, output_path: str, original_filename: str,
     import numpy as np
     from PIL import Image
     import io as _io
+    import math
 
     DPI, QUALITY = 200, 85
     print(f"[DEBUG] recoloring via PyMuPDF pixel render (high quality)")
 
     src = fitz.open(input_path)
+    
+    if len(src) > 50:
+        DPI = int(200 * math.sqrt(50 / len(src)))
+        DPI = max(72, min(200, DPI))
+        QUALITY = min(85, max(60, int(85 * (50 / len(src)))))
+
     out_doc = fitz.open()
 
     with _recolor_lock:
