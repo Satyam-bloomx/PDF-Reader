@@ -197,6 +197,18 @@ async def index():
     #status.done { background: rgba(30,60,35,0.4); color: #88cc90; border: 1px solid rgba(60,160,70,0.25); }
     #status.error { background: rgba(80,20,20,0.35); color: #e08080; border: 1px solid rgba(180,60,60,0.25); }
 
+    .mode-toggle-wrap { display: flex; gap: 6px; }
+    .mode-opt {
+      flex: 1; display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+      border: 1px solid rgba(184,146,74,0.18); border-radius: 10px; cursor: pointer;
+      background: rgba(0,0,0,0.2); transition: all 0.2s;
+    }
+    .mode-opt:hover { border-color: rgba(184,146,74,0.4); background: rgba(184,146,74,0.06); }
+    .mode-opt.active { border-color: rgba(184,146,74,0.55); background: rgba(184,146,74,0.12); }
+    .mode-icon { font-size: 1rem; color: var(--gold); flex-shrink: 0; }
+    .mode-name { font-size: 0.68rem; font-weight: 600; color: var(--text); letter-spacing: 0.04em; }
+    .mode-desc { font-size: 0.56rem; color: var(--muted); margin-top: 1px; }
+
     #dl-btn {
       background: linear-gradient(135deg, rgba(90,160,80,0.2), rgba(60,130,60,0.1));
       border: 1px solid rgba(90,160,80,0.32); color: #88cc90; border-radius: 12px; padding: 10px;
@@ -397,6 +409,24 @@ async def index():
           <input type="color" id="violet-color" value="#ffb266">
           <input type="color" id="teal-color" value="#ffe699">
           <input type="color" id="coral-color" value="#ffc794">
+        </div>
+
+        <div class="sec-ttl" style="margin-top:2px;">Output Mode</div>
+        <div class="mode-toggle-wrap">
+          <div class="mode-opt active" id="mode-quality" onclick="setMode('quality')">
+            <div class="mode-icon">&#x2605;</div>
+            <div class="mode-info">
+              <div class="mode-name">High Quality</div>
+              <div class="mode-desc">Pixel-perfect &bull; all 3 colors &bull; ~35MB</div>
+            </div>
+          </div>
+          <div class="mode-opt" id="mode-small" onclick="setMode('small')">
+            <div class="mode-icon">&#x26A1;</div>
+            <div class="mode-info">
+              <div class="mode-name">Small Size</div>
+              <div class="mode-desc">All colors &bull; works everywhere &bull; ~8MB</div>
+            </div>
+          </div>
         </div>
 
         <button class="btn-main" id="beautify-btn" onclick="uploadFile()" disabled>&#x2736; &nbsp; Beautify PDF &nbsp; &#x2736;</button>
@@ -649,7 +679,13 @@ async def index():
   document.getElementById('bg-op').addEventListener('input',updatePrev);
 
   // ══════════════ FILE UPLOAD ══════════════
-  let curJob=null, poll=null;
+  let curJob=null, poll=null, currentMode='quality';
+  function setMode(m){
+    currentMode=m;
+    document.getElementById('mode-quality').classList.toggle('active', m==='quality');
+    document.getElementById('mode-small').classList.toggle('active', m==='small');
+    schedulePreview();
+  }
   const dz=document.getElementById('drop-zone'), fi=document.getElementById('file-input');
   const bBtn=document.getElementById('beautify-btn'), st=document.getElementById('status'), dlBtn=document.getElementById('dl-btn');
 
@@ -705,6 +741,7 @@ async def index():
     fd.append('bg_color',applyOp(bgPk.value,parseInt(document.getElementById('bg-op').value)));
     fd.append('text_color',txPk.value);
     ['gold','violet','teal','coral'].forEach(n=>fd.append(n+'_color',document.getElementById(n+'-color').value));
+    fd.append('mode', currentMode);
     try{
       const r=await fetch('/preview',{method:'POST',body:fd});
       if(!r.ok){
@@ -759,6 +796,7 @@ async def index():
     fd.append('bg_color',applyOp(bgPk.value,parseInt(document.getElementById('bg-op').value)));
     fd.append('text_color',txPk.value);
     ['gold','violet','teal','coral'].forEach(n=>fd.append(n+'_color',document.getElementById(n+'-color').value));
+    fd.append('mode', currentMode);
     try{
       const r=await fetch('/upload',{method:'POST',body:fd});
       const d=await r.json();
@@ -901,6 +939,7 @@ async def preview_pdf(
     violet_color: str = Form("#ffb266"),
     teal_color: str = Form("#ffe699"),
     coral_color: str = Form("#ffc794"),
+    mode: str = Form("quality"),
 ):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted")
@@ -914,6 +953,8 @@ async def preview_pdf(
         "coral":  hex_to_rgb(coral_color),
     }
 
+    render_fn = _render_preview_page
+
     with tempfile.TemporaryDirectory() as tmp:
         input_path = os.path.join(tmp, "input.pdf")
 
@@ -923,7 +964,7 @@ async def preview_pdf(
         try:
             loop = asyncio.get_running_loop()
             png_bytes = await loop.run_in_executor(
-                None, _render_preview_page, input_path, palette
+                None, render_fn, input_path, palette
             )
         except Exception as e:
             traceback.print_exc()
@@ -968,6 +1009,36 @@ def _render_preview_page(input_path: str, palette: dict) -> bytes:
     return buf.getvalue()
 
 
+def _render_preview_page_small(input_path: str, palette: dict) -> bytes:
+    """
+    Preview for Small Size mode: recolor page 1 with pikepdf (vector), then
+    render the result with PyMuPDF so the user sees what the vector output looks like.
+    """
+    import fitz
+    import numpy as np
+    from PIL import Image
+    import io as _io
+
+    from .recolor import recolor_pdf
+
+    with tempfile.TemporaryDirectory() as tmp:
+        recolored_path = os.path.join(tmp, "recolored.pdf")
+        with _recolor_lock:
+            recolor_pdf(input_path, recolored_path, palette, max_pages=1)
+
+        doc = fitz.open(recolored_path)
+        page = doc[0]
+        mat = fitz.Matrix(180 / 72, 180 / 72)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        doc.close()
+
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+    img = Image.fromarray(arr, "RGB")
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG", optimize=False)
+    return buf.getvalue()
+
+
 @app.post("/upload")
 async def upload_pdf(
     background_tasks: BackgroundTasks,
@@ -978,6 +1049,7 @@ async def upload_pdf(
     violet_color: str = Form("#ffb266"),
     teal_color: str = Form("#ffe699"),
     coral_color: str = Form("#ffc794"),
+    mode: str = Form("quality"),
 ):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted")
@@ -1005,15 +1077,15 @@ async def upload_pdf(
         "timestamp": time.time()
     }
 
-    background_tasks.add_task(_process_pdf, job_id, str(input_path), str(output_path), file.filename, palette)
+    background_tasks.add_task(_process_pdf, job_id, str(input_path), str(output_path), file.filename, palette, mode)
 
     return {"job_id": job_id, "status": "processing"}
 
 
-async def _process_pdf(job_id: str, input_path: str, output_path: str, original_filename: str, palette: dict):
+async def _process_pdf(job_id: str, input_path: str, output_path: str, original_filename: str, palette: dict, mode: str = "quality"):
     loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(None, _process_pdf_sync, input_path, output_path, original_filename, palette)
+        await loop.run_in_executor(None, _process_pdf_sync, input_path, output_path, original_filename, palette, mode)
         jobs[job_id]["status"] = "done"
     except Exception as e:
         jobs[job_id]["status"] = "error"
@@ -1021,20 +1093,22 @@ async def _process_pdf(job_id: str, input_path: str, output_path: str, original_
         traceback.print_exc()
 
 
-def _process_pdf_sync(input_path: str, output_path: str, original_filename: str, palette: dict):
-    """
-    Render every page with PyMuPDF (same engine as preview), apply _recolor_array
-    pixel-by-pixel, then pack back into a PDF.  This guarantees the downloaded PDF
-    looks identical to the Live Preview — bold/accent-coloured text included.
-    """
+def _process_pdf_sync(input_path: str, output_path: str, original_filename: str, palette: dict, mode: str = "quality"):
+    if mode == "small":
+        from .recolor import recolor_pdf
+        print(f"[DEBUG] recoloring via pikepdf (small size)")
+        with _recolor_lock:
+            recolor_pdf(input_path, output_path, palette)
+        print("[DEBUG] done")
+        return
+
     import fitz
     import numpy as np
     from PIL import Image
     import io as _io
 
-    print(f"[DEBUG] recoloring {original_filename} via PyMuPDF pixel render")
-
-    DPI = 160
+    DPI, QUALITY = 200, 85
+    print(f"[DEBUG] recoloring via PyMuPDF pixel render (high quality)")
 
     src = fitz.open(input_path)
     out_doc = fitz.open()
@@ -1045,26 +1119,21 @@ def _process_pdf_sync(input_path: str, output_path: str, original_filename: str,
             page = src[page_num]
             mat = fitz.Matrix(DPI / 72, DPI / 72)
             pix = page.get_pixmap(matrix=mat, alpha=False)
-
             arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
             arr = arr.astype(np.float32) / 255.0
             recolored = _recolor_array(arr)
             out_arr = (np.clip(recolored, 0, 1) * 255).astype(np.uint8)
-
             img = Image.fromarray(out_arr, "RGB")
             buf = _io.BytesIO()
-            img.save(buf, format="JPEG", quality=90)
+            img.save(buf, format="JPEG", quality=QUALITY)
             buf.seek(0)
-            jpeg_bytes = buf.read()
-
-            # Page dimensions in PDF points (1 point = 1/72 inch)
             new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
-            new_page.insert_image(new_page.rect, stream=jpeg_bytes)
+            new_page.insert_image(new_page.rect, stream=buf.read())
 
     src.close()
     out_doc.save(output_path, deflate=True)
     out_doc.close()
-    print(f"[DEBUG] done — {len(src.pages) if not src.is_closed else '?'} pages")
+    print("[DEBUG] done")
 
 
 @app.get("/status/{job_id}")

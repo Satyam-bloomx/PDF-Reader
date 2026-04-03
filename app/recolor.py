@@ -305,25 +305,74 @@ def recolor_page_stream(page: pikepdf.Page, pdf: pikepdf.Pdf, visited_xobjs: set
     resources = page.obj.get("/Resources")
 
     instructions = []
-    in_text = False  # track BT/ET text blocks so text gets TEXT color, fills get BG
+    in_text = False  # track BT/ET text blocks
+
     for operands, operator in pikepdf.parse_content_stream(page):
         op = bytes(operator)
+
         if op == b"BT":
             in_text = True
-            # Inject default TEXT color so text is visible even if no explicitly set
+            # Inject default TEXT fill color at start of every text block
+            # so glyphs without an explicit color are visible
             r, g, b = TEXT
             instructions.append(([_to_pdf_num(v) for v in (r, g, b)], pikepdf.Operator("rg")))
             instructions.append((operands, operator))
             continue
         elif op == b"ET":
             in_text = False
-        # No longer skip — transparent recoloring makes the interior see-through
+
+        # sc / scn — fill color in current colorspace
+        elif op in (b"sc", b"scn"):
+            nums = [v for v in operands if isinstance(v, (int, float)) or
+                    (hasattr(v, '__float__') and not hasattr(v, 'keys'))]
+            try:
+                nums = [float(v) for v in nums]
+            except Exception:
+                instructions.append((operands, operator))
+                continue
+            is_stroke_op = False
+            if len(nums) == 1:
+                mapped = _map_rgb(nums[0], nums[0], nums[0], for_text=in_text, for_stroke=is_stroke_op)
+            elif len(nums) == 3:
+                mapped = _map_rgb(nums[0], nums[1], nums[2], for_text=in_text, for_stroke=is_stroke_op)
+            elif len(nums) == 4:
+                c, m, y, k = nums
+                mapped = _map_rgb((1-c)*(1-k), (1-m)*(1-k), (1-y)*(1-k), for_text=in_text, for_stroke=is_stroke_op)
+            else:
+                instructions.append((operands, operator))
+                continue
+            new_ops = [_to_pdf_num(v) for v in mapped]
+            instructions.append((new_ops, pikepdf.Operator("rg")))
+            continue
+
+        # SC / SCN — stroke color in current colorspace
+        elif op in (b"SC", b"SCN"):
+            nums = [v for v in operands if isinstance(v, (int, float)) or
+                    (hasattr(v, '__float__') and not hasattr(v, 'keys'))]
+            try:
+                nums = [float(v) for v in nums]
+            except Exception:
+                instructions.append((operands, operator))
+                continue
+            if len(nums) == 1:
+                mapped = _map_rgb(nums[0], nums[0], nums[0], for_stroke=True)
+            elif len(nums) == 3:
+                mapped = _map_rgb(nums[0], nums[1], nums[2], for_stroke=True)
+            elif len(nums) == 4:
+                c, m, y, k = nums
+                mapped = _map_rgb((1-c)*(1-k), (1-m)*(1-k), (1-y)*(1-k), for_stroke=True)
+            else:
+                instructions.append((operands, operator))
+                continue
+            new_ops = [_to_pdf_num(v) for v in mapped]
+            instructions.append((new_ops, pikepdf.Operator("RG")))
+            continue
+
         if op in _COLOR_OPS:
             n, is_cmyk, is_stroke = _COLOR_OPS[op]
             new_operands = _remap_color_args(list(operands), n,
                                              for_text=in_text,
                                              for_stroke=(is_stroke and not in_text))
-            # Promote grey ops to RGB when they now carry a 3-component TEXT color
             needs_rgb = (in_text or (is_stroke and not in_text)) and op in (b"g", b"G")
             if needs_rgb and len(new_operands) == 3:
                 new_op = pikepdf.Operator("rg") if op == b"g" else pikepdf.Operator("RG")
