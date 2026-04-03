@@ -429,7 +429,7 @@ async def index():
             <div class="mode-icon">&#x2605;</div>
             <div class="mode-info">
               <div class="mode-name">High Quality</div>
-              <div class="mode-desc">Pixel-perfect &bull; all 3 colors &bull; ~35MB</div>
+              <div class="mode-desc">Ultra-sharp &bull; premium colors &bull; ~35MB</div>
             </div>
           </div>
           <div class="mode-opt" id="mode-small" onclick="setMode('small')">
@@ -481,18 +481,18 @@ async def index():
   <script>
   // ══════════════ ZODIAC DATA ══════════════
   const SIGNS = [
-    {name:'Aries',       sym:'\u2648', bg:'#1a0500', text:'#ff9966', accent:'#ffd85a', el:'Fire',  dates:'Mar 21 \u2013 Apr 19'},
-    {name:'Taurus',      sym:'\u2649', bg:'#0a1a0a', text:'#88d488', accent:'#c8f0a0', el:'Earth', dates:'Apr 20 \u2013 May 20'},
-    {name:'Gemini',      sym:'\u264A', bg:'#04101f', text:'#88ccff', accent:'#ffe08a', el:'Air',   dates:'May 21 \u2013 Jun 20'},
-    {name:'Cancer',      sym:'\u264B', bg:'#0d1b2a', text:'#c8d8f0', accent:'#d0c0ff', el:'Water', dates:'Jun 21 \u2013 Jul 22'},
-    {name:'Leo',         sym:'\u264C', bg:'#1c0f00', text:'#ffd700', accent:'#ff9944', el:'Fire',  dates:'Jul 23 \u2013 Aug 22'},
-    {name:'Virgo',       sym:'\u264D', bg:'#f0ece0', text:'#2c1a0e', accent:'#b05010', el:'Earth', dates:'Aug 23 \u2013 Sep 22'},
-    {name:'Libra',       sym:'\u264E', bg:'#180a14', text:'#ffaac8', accent:'#ffdd88', el:'Air',   dates:'Sep 23 \u2013 Oct 22'},
-    {name:'Scorpio',     sym:'\u264F', bg:'#0b0018', text:'#b080ff', accent:'#ff6688', el:'Water', dates:'Oct 23 \u2013 Nov 21'},
-    {name:'Sagittarius', sym:'\u2650', bg:'#100a00', text:'#ffcc66', accent:'#ff8844', el:'Fire',  dates:'Nov 22 \u2013 Dec 21'},
-    {name:'Capricorn',   sym:'\u2651', bg:'#080808', text:'#b0b0c0', accent:'#88aacc', el:'Earth', dates:'Dec 22 \u2013 Jan 19'},
-    {name:'Aquarius',    sym:'\u2652', bg:'#030c18', text:'#00d4ff', accent:'#88eeff', el:'Air',   dates:'Jan 20 \u2013 Feb 18'},
-    {name:'Pisces',      sym:'\u2653', bg:'#04081a', text:'#66b8dd', accent:'#aa88ff', el:'Water', dates:'Feb 19 \u2013 Mar 20'},
+    {name:'Aries',       sym:'\u2648', bg:'#1F0B0E', text:'#F5EBEB', accent:'#D4AF37', el:'Fire',  dates:'Mar 21 \u2013 Apr 19'},
+    {name:'Taurus',      sym:'\u2649', bg:'#0B1A13', text:'#E6F0E9', accent:'#C4A484', el:'Earth', dates:'Apr 20 \u2013 May 20'},
+    {name:'Gemini',      sym:'\u264A', bg:'#141517', text:'#F0F2F5', accent:'#E2B14B', el:'Air',   dates:'May 21 \u2013 Jun 20'},
+    {name:'Cancer',      sym:'\u264B', bg:'#0F1626', text:'#E8EEF2', accent:'#9FB1BC', el:'Water', dates:'Jun 21 \u2013 Jul 22'},
+    {name:'Leo',         sym:'\u264C', bg:'#1A0F06', text:'#F7F1E6', accent:'#E59500', el:'Fire',  dates:'Jul 23 \u2013 Aug 22'},
+    {name:'Virgo',       sym:'\u264D', bg:'#191A14', text:'#F2F2EC', accent:'#9C8B72', el:'Earth', dates:'Aug 23 \u2013 Sep 22'},
+    {name:'Libra',       sym:'\u264E', bg:'#181116', text:'#F5ECEE', accent:'#D69CAB', el:'Air',   dates:'Sep 23 \u2013 Oct 22'},
+    {name:'Scorpio',     sym:'\u264F', bg:'#0A0A0C', text:'#EBEBEB', accent:'#9B2335', el:'Water', dates:'Oct 23 \u2013 Nov 21'},
+    {name:'Sagittarius', sym:'\u2650', bg:'#140C00', text:'#F5EBE0', accent:'#CF5C36', el:'Fire',  dates:'Nov 22 \u2013 Dec 21'},
+    {name:'Capricorn',   sym:'\u2651', bg:'#14161A', text:'#E9ECEF', accent:'#7B8B9E', el:'Earth', dates:'Dec 22 \u2013 Jan 19'},
+    {name:'Aquarius',    sym:'\u2652', bg:'#041527', text:'#D9EEF7', accent:'#4FC3F7', el:'Air',   dates:'Jan 20 \u2013 Feb 18'},
+    {name:'Pisces',      sym:'\u2653', bg:'#05191C', text:'#DDF0ED', accent:'#48A9A6', el:'Water', dates:'Feb 19 \u2013 Mar 20'},
   ];
   const EC = {Fire:'#e8622a', Earth:'#5a9e48', Air:'#3aa8d8', Water:'#4060cc'};
 
@@ -1120,15 +1120,16 @@ def _process_pdf_sync(input_path: str, output_path: str, original_filename: str,
     import io as _io
     import math
 
-    DPI, QUALITY = 200, 85
+    DPI, QUALITY = 200, 95
     print(f"[DEBUG] recoloring via PyMuPDF pixel render (high quality)")
 
     src = fitz.open(input_path)
     
     if len(src) > 50:
+        # For long documents, we scale only if they are likely to exceed ~35MB
         DPI = int(200 * math.sqrt(50 / len(src)))
-        DPI = max(72, min(200, DPI))
-        QUALITY = min(85, max(60, int(85 * (50 / len(src)))))
+        DPI = max(80, min(200, DPI))
+        QUALITY = max(80, min(95, int(95 * (50 / len(src))**0.15)))
 
     out_doc = fitz.open()
 
