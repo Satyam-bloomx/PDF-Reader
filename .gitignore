@@ -21,3 +21,10 @@ Thumbs.db
 # IDE files
 .vscode/
 .idea/
+
+# Logs
+*.log
+server.log
+
+# Claude
+.claude/

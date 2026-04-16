@@ -17,8 +17,83 @@ import tempfile
 import threading
 from pathlib import Path
 from contextlib import asynccontextmanager
+from concurrent.futures import ProcessPoolExecutor
 
 _recolor_lock = threading.Lock()
+
+
+def _render_page_worker(args):
+    """
+    Render one page to JPEG with background composite.
+    Must be a top-level function for ProcessPoolExecutor pickling.
+    All recolor logic is inlined — no app.* imports needed.
+    """
+    page_num, input_path, dpi, quality, bg_path, palette = args
+
+    import fitz
+    import numpy as np
+    import io as _io
+    from PIL import Image
+
+    # ── Inline recolor using passed palette ──────────────────────────────────
+    BG_c     = np.array(palette.get("bg",     (0.502, 0.027, 0.063)), dtype=np.float32)
+    TEXT_c   = np.array(palette.get("text",   (1.000, 0.980, 0.820)), dtype=np.float32)
+    GOLD_c   = np.array(palette.get("gold",   (1.000, 0.843, 0.353)), dtype=np.float32)
+    VIOLET_c = np.array(palette.get("violet", (1.000, 0.700, 0.400)), dtype=np.float32)
+    TEAL_c   = np.array(palette.get("teal",   (1.000, 0.900, 0.600)), dtype=np.float32)
+    CORAL_c  = np.array(palette.get("coral",  (1.000, 0.780, 0.580)), dtype=np.float32)
+
+    def recolor(arr_f):
+        r, g, b = arr_f[:,:,0], arr_f[:,:,1], arr_f[:,:,2]
+        mx = arr_f.max(axis=2); mn = arr_f.min(axis=2)
+        lum = 0.299*r + 0.587*g + 0.114*b
+        sat = (mx - mn) / (mx + 1e-6)
+        out = TEXT_c + lum[:,:,None] * (BG_c - TEXT_c)
+        color_mask = sat >= 0.4
+        if color_mask.any():
+            delta = mx - mn + 1e-6
+            hue = np.zeros(arr_f.shape[:2], dtype=np.float32)
+            mr, mgm, mbm = (mx==r), (mx==g), (mx==b)
+            hue[mr]  = ((g[mr]  - b[mr])  / delta[mr])  % 6
+            hue[mgm] = (b[mgm]  - r[mgm]) / delta[mgm]  + 2
+            hue[mbm] = (r[mbm]  - g[mbm]) / delta[mbm]  + 4
+            hue /= 6.0
+            warm  = (hue < 0.18) | (hue > 0.88)
+            green = (hue >= 0.18) & (hue < 0.55)
+            cool  = (hue >= 0.55) & (hue <= 0.85)
+            accent = np.where(warm[:,:,None], GOLD_c,
+                     np.where(green[:,:,None], TEAL_c,
+                     np.where(cool[:,:,None],  VIOLET_c, CORAL_c)))
+            mix = np.clip((sat - 0.4) / 0.6, 0, 1)[:,:,None]
+            grey = TEXT_c + lum[:,:,None] * (BG_c - TEXT_c)
+            out[color_mask] = ((1-mix)*grey + mix*accent)[color_mask]
+        return np.clip(out, 0, 1)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    src = fitz.open(input_path)
+    page = src[page_num]
+    pt_w, pt_h = page.rect.width, page.rect.height
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3).copy()
+    src.close()
+
+    # Compute white mask on ORIGINAL pixels (before recolor turns white → maroon)
+    arr_i = arr.astype(np.int16)
+    white_mask = ((arr_i.min(axis=2) >= 200) & ((arr_i.max(axis=2) - arr_i.min(axis=2)) <= 30))[:,:,None]
+
+    out_arr = (np.clip(recolor(arr.astype(np.float32) / 255.0), 0, 1) * 255).astype(np.uint8)
+
+    if bg_path:
+        bg_np = np.array(Image.open(bg_path).convert("RGB").resize(
+            (pix.width, pix.height), Image.BILINEAR), dtype=np.uint8)
+        out_arr = np.where(white_mask, bg_np, out_arr).astype(np.uint8)
+
+    buf = _io.BytesIO()
+    Image.fromarray(out_arr, "RGB").save(buf, format="JPEG", quality=quality, subsampling=0)
+    return (page_num, pt_w, pt_h, buf.getvalue())
+
+
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
@@ -1066,6 +1141,10 @@ async def upload_pdf(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted")
 
+    active_jobs = sum(1 for j in jobs.values() if j["status"] in ("pending", "processing"))
+    if active_jobs >= 15:
+        raise HTTPException(status_code=429, detail="Max 15 PDFs allowed at a time. Please wait for current jobs to finish.")
+
     job_id = str(uuid.uuid4())
     input_path = UPLOAD_DIR / f"{job_id}_input.pdf"
     output_path = OUTPUT_DIR / f"{job_id}_output.pdf"
@@ -1105,7 +1184,28 @@ async def _process_pdf(job_id: str, input_path: str, output_path: str, original_
         traceback.print_exc()
 
 
+# Hardcoded background template path — place your design here
+BG_TEMPLATE_PATH = BASE_DIR / "app" / "assets" / "bg_template.png"
+
+# Positions (0-based) in the FINAL document where full template pages are inserted
+TEMPLATE_PAGE_POSITIONS = [0, 2, 3]  # start, 3rd place, 4th place (end added automatically)
+
+
+def _make_template_page(out_doc, bg_img_pil, width_pt: float, height_pt: float):
+    """Insert a full-bleed template page (background design only, no content)."""
+    import io as _io
+    buf = _io.BytesIO()
+    bg_resized = bg_img_pil.convert("RGB").resize(
+        (int(width_pt * 200 / 72), int(height_pt * 200 / 72)), 1  # LANCZOS=1
+    )
+    bg_resized.save(buf, format="JPEG", quality=95)
+    buf.seek(0)
+    page = out_doc.new_page(width=width_pt, height=height_pt)
+    page.insert_image(page.rect, stream=buf.read())
+
+
 def _process_pdf_sync(input_path: str, output_path: str, original_filename: str, palette: dict, mode: str = "quality"):
+    t_total_start = time.time()
     if mode == "small":
         from .recolor import recolor_pdf
         print(f"[DEBUG] recoloring via pikepdf (small size)")
@@ -1120,39 +1220,107 @@ def _process_pdf_sync(input_path: str, output_path: str, original_filename: str,
     import io as _io
     import math
 
-    DPI, QUALITY = 200, 95
+    # 200 DPI: sharp text, subsampling=0 removes chroma blur
+    # Quality 72: compensates for higher DPI to keep file size reasonable
+    DPI, QUALITY = 180, 80
     print(f"[DEBUG] recoloring via PyMuPDF pixel render (high quality)")
 
-    src = fitz.open(input_path)
-    
-    if len(src) > 50:
-        # For long documents, we scale only if they are likely to exceed ~35MB
-        DPI = int(200 * math.sqrt(50 / len(src)))
-        DPI = max(80, min(200, DPI))
-        QUALITY = max(80, min(95, int(95 * (50 / len(src))**0.15)))
+    # Load hardcoded background template
+    custom_bg = None
+    if BG_TEMPLATE_PATH.exists():
+        try:
+            custom_bg = Image.open(str(BG_TEMPLATE_PATH)).convert("RGBA")
+            print(f"[DEBUG] loaded background template: {custom_bg.size}")
+        except Exception as e:
+            print(f"[DEBUG] failed to load bg template: {e}")
+    else:
+        print(f"[DEBUG] no bg template found at {BG_TEMPLATE_PATH}")
 
+    src = fitz.open(input_path)
+
+    # Strip background images from every page at the PDF level.
+    # LeoStar embeds one large background image XObject per page.
+    # We find its name in the page resources, then remove its Do operator
+    # (and surrounding q/cm/Q context) from the content stream directly.
+    import re as _re
+    page_area = src[0].rect.width * src[0].rect.height
+
+    for page_num in range(len(src)):
+        page = src[page_num]
+        images = page.get_images(full=True)
+        names_to_remove = set()
+        for img in images:
+            img_w, img_h = img[2], img[3]
+            img_name = img[7]  # resource name e.g. "R8"
+            if img_w * img_h > page_area * 0.5:
+                names_to_remove.add(img_name)
+
+        if not names_to_remove:
+            continue
+
+        content = page.read_contents().decode('latin-1')
+        for name in names_to_remove:
+            # Remove the block:  q ... cm \n /NAME Do \n Q \n Q
+            pattern = r'q\s[^q]*?/' + _re.escape(name) + r'\s+Do\s+Q\s+Q\s+'
+            content = _re.sub(pattern, '', content, flags=_re.DOTALL)
+
+        # Write modified content back
+        xref = page.get_contents()[0] if page.get_contents() else 0
+        if xref:
+            src.update_stream(xref, content.encode('latin-1'))
+
+    # Save stripped PDF so workers can open it (in-memory changes aren't visible to subprocesses)
+    stripped_tmp = input_path + ".stripped.pdf"
+    src.save(stripped_tmp)
+    src.close()
+
+    bg_path_str = str(BG_TEMPLATE_PATH) if BG_TEMPLATE_PATH.exists() else None
+    num_pages = len(fitz.open(stripped_tmp))
+    args_list = [
+        (i, stripped_tmp, DPI, QUALITY, bg_path_str, palette)
+        for i in range(num_pages)
+    ]
+
+    t_render_start = time.time()
+    with ProcessPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(_render_page_worker, args_list))
+    results.sort(key=lambda x: x[0])
+    content_pages = [(w, h, j) for _, w, h, j in results]
+    print(f"[TIMING] render+composite: {time.time() - t_render_start:.1f}s for {num_pages} pages")
+
+    try:
+        os.remove(stripped_tmp)
+    except Exception:
+        pass
+
+    # Second pass: assemble final document
+    ref_w, ref_h = content_pages[0][0], content_pages[0][1]
     out_doc = fitz.open()
 
-    with _recolor_lock:
-        _set_palette(palette)
-        for page_num in range(len(src)):
-            page = src[page_num]
-            mat = fitz.Matrix(DPI / 72, DPI / 72)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-            arr = arr.astype(np.float32) / 255.0
-            recolored = _recolor_array(arr)
-            out_arr = (np.clip(recolored, 0, 1) * 255).astype(np.uint8)
-            img = Image.fromarray(out_arr, "RGB")
-            buf = _io.BytesIO()
-            img.save(buf, format="JPEG", quality=QUALITY)
-            buf.seek(0)
-            new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
-            new_page.insert_image(new_page.rect, stream=buf.read())
+    def insert_template(position_label: str):
+        if custom_bg is not None:
+            _make_template_page(out_doc, custom_bg, ref_w, ref_h)
+            print(f"[DEBUG] inserted template page at {position_label}")
 
-    src.close()
-    out_doc.save(output_path, deflate=True)
+    def insert_content_page(w, h, jpeg_bytes):
+        p = out_doc.new_page(width=w, height=h)
+        p.insert_image(p.rect, stream=jpeg_bytes)
+
+    # Build final page order:
+    # [template, content[0], template, template, content[1], ..., template]
+    insert_template("start")
+    for i, (w, h, png) in enumerate(content_pages):
+        if i == 1:
+            insert_template("3rd place")
+            insert_template("4th place")
+        insert_content_page(w, h, png)
+    insert_template("end")
+
+    out_doc.save(output_path, deflate=True, garbage=4)
     out_doc.close()
+
+
+    print(f"[TIMING] total: {time.time() - t_total_start:.1f}s")
     print("[DEBUG] done")
 
 
