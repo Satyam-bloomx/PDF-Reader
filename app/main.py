@@ -1206,24 +1206,13 @@ def _make_template_page(out_doc, bg_img_pil, width_pt: float, height_pt: float):
 
 def _process_pdf_sync(input_path: str, output_path: str, original_filename: str, palette: dict, mode: str = "quality"):
     t_total_start = time.time()
-    if mode == "small":
-        from .recolor import recolor_pdf
-        print(f"[DEBUG] recoloring via pikepdf (small size)")
-        with _recolor_lock:
-            recolor_pdf(input_path, output_path, palette)
-        print("[DEBUG] done")
-        return
-
+    
     import fitz
     import numpy as np
     from PIL import Image
     import io as _io
     import math
-
-    # 200 DPI: sharp text, subsampling=0 removes chroma blur
-    # Quality 72: compensates for higher DPI to keep file size reasonable
-    DPI, QUALITY = 180, 80
-    print(f"[DEBUG] recoloring via PyMuPDF pixel render (high quality)")
+    import re as _re
 
     # Load hardcoded background template
     custom_bg = None
@@ -1242,7 +1231,6 @@ def _process_pdf_sync(input_path: str, output_path: str, original_filename: str,
     # LeoStar embeds one large background image XObject per page.
     # We find its name in the page resources, then remove its Do operator
     # (and surrounding q/cm/Q context) from the content stream directly.
-    import re as _re
     page_area = src[0].rect.width * src[0].rect.height
 
     for page_num in range(len(src)):
@@ -1269,10 +1257,69 @@ def _process_pdf_sync(input_path: str, output_path: str, original_filename: str,
         if xref:
             src.update_stream(xref, content.encode('latin-1'))
 
-    # Save stripped PDF so workers can open it (in-memory changes aren't visible to subprocesses)
+    # Save stripped PDF so workers can open it
     stripped_tmp = input_path + ".stripped.pdf"
     src.save(stripped_tmp)
     src.close()
+
+    if mode == "small":
+        from .recolor import recolor_pdf
+        print(f"[DEBUG] recoloring via pikepdf (small size)")
+        recolored_tmp = input_path + ".recolored.pdf"
+        with _recolor_lock:
+            # Tell recolor_pdf NOT to inject the solid flat color bg if we have a custom bg
+            recolor_pdf(stripped_tmp, recolored_tmp, palette, inject_bg_rect=(custom_bg is None))
+        
+        # Now assemble with template pages and background image
+        out_doc = fitz.open()
+        src_recolored = fitz.open(recolored_tmp)
+        ref_w, ref_h = src_recolored[0].rect.width, src_recolored[0].rect.height
+        
+        def insert_template(position_label: str):
+            if custom_bg is not None:
+                _make_template_page(out_doc, custom_bg, ref_w, ref_h)
+                print(f"[DEBUG] inserted template page at {position_label} (small mode)")
+
+        # Prepare 1-page document with just background for overlay
+        bg_doc = None
+        if custom_bg is not None:
+            bg_doc = fitz.open()
+            _make_template_page(bg_doc, custom_bg, ref_w, ref_h)
+
+        insert_template("start")
+        for i in range(len(src_recolored)):
+            if i == 1:
+                insert_template("3rd place")
+                insert_template("4th place")
+            out_doc.insert_pdf(src_recolored, from_page=i, to_page=i)
+            # Find the appended page (it's the last one in out_doc right now)
+            inserted_page = out_doc[-1]
+            if bg_doc is not None:
+                inserted_page.show_pdf_page(inserted_page.rect, bg_doc, 0, keep_proportion=False, overlay=False)
+
+        insert_template("end")
+        
+        out_doc.save(output_path, deflate=True, garbage=4)
+        out_doc.close()
+        src_recolored.close()
+        if bg_doc is not None:
+            bg_doc.close()
+            
+        try:
+            os.remove(stripped_tmp)
+            os.remove(recolored_tmp)
+        except Exception:
+            pass
+
+        print(f"[TIMING] total: {time.time() - t_total_start:.1f}s")
+        print("[DEBUG] done")
+        return
+
+    # --- High Quality Mode ---
+    # 200 DPI: sharp text, subsampling=0 removes chroma blur
+    # Quality 72: compensates for higher DPI to keep file size reasonable
+    DPI, QUALITY = 180, 80
+    print(f"[DEBUG] recoloring via PyMuPDF pixel render (high quality)")
 
     bg_path_str = str(BG_TEMPLATE_PATH) if BG_TEMPLATE_PATH.exists() else None
     num_pages = len(fitz.open(stripped_tmp))
@@ -1307,7 +1354,6 @@ def _process_pdf_sync(input_path: str, output_path: str, original_filename: str,
         p.insert_image(p.rect, stream=jpeg_bytes)
 
     # Build final page order:
-    # [template, content[0], template, template, content[1], ..., template]
     insert_template("start")
     for i, (w, h, png) in enumerate(content_pages):
         if i == 1:
@@ -1318,7 +1364,6 @@ def _process_pdf_sync(input_path: str, output_path: str, original_filename: str,
 
     out_doc.save(output_path, deflate=True, garbage=4)
     out_doc.close()
-
 
     print(f"[TIMING] total: {time.time() - t_total_start:.1f}s")
     print("[DEBUG] done")

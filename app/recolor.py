@@ -285,7 +285,7 @@ def _recolor_xobjects(resources: pikepdf.Object, _pdf: pikepdf.Pdf, visited: set
             _recolor_image_xobj(xobj)
 
 
-def recolor_page_stream(page: pikepdf.Page, pdf: pikepdf.Pdf, visited_xobjs: set = None) -> None:
+def recolor_page_stream(page: pikepdf.Page, pdf: pikepdf.Pdf, visited_xobjs: set = None, inject_bg_rect: bool = True) -> None:
     """
     Recolor a single pikepdf Page in-place by rewriting its content stream.
     Injects navy background rect at the start, then remaps all color operators.
@@ -297,13 +297,15 @@ def recolor_page_stream(page: pikepdf.Page, pdf: pikepdf.Pdf, visited_xobjs: set
 
     # Background rect as raw bytes — simplest, most cross-viewer compatible
     r, g, b = BG
-    bg_bytes = (
-        b"q\n"
-        + f"{r:.4f} {g:.4f} {b:.4f} rg\n".encode()
-        + f"{x0:.4f} {y0:.4f} {w:.4f} {h:.4f} re\n".encode()
-        + b"f\n"
-        + b"Q\n"
-    )
+    bg_bytes = b""
+    if inject_bg_rect:
+        bg_bytes = (
+            b"q\n"
+            + f"{r:.4f} {g:.4f} {b:.4f} rg\n".encode()
+            + f"{x0:.4f} {y0:.4f} {w:.4f} {h:.4f} re\n".encode()
+            + b"f\n"
+            + b"Q\n"
+        )
 
     if visited_xobjs is None:
         visited_xobjs = set()
@@ -402,7 +404,7 @@ def add_background_rect(page: pikepdf.Page, pdf: pikepdf.Pdf) -> None:
         page.obj["/Contents"] = Array([bg_obj, existing])
 
 
-def recolor_pdf(input_path: str, output_path: str, palette: dict = None, max_pages: int = None) -> None:
+def recolor_pdf(input_path: str, output_path: str, palette: dict = None, max_pages: int = None, inject_bg_rect: bool = True) -> None:
     """
     Open a PDF, recolor every page at vector level, write output.
     palette: optional dict with keys bg, text, gold, violet, teal, coral → (r,g,b) tuples
@@ -416,7 +418,7 @@ def recolor_pdf(input_path: str, output_path: str, palette: dict = None, max_pag
         pages = list(pdf.pages)[:max_pages] if max_pages else pdf.pages
         for page in pages:
             try:
-                recolor_page_stream(page, pdf, visited_xobjs)
+                recolor_page_stream(page, pdf, visited_xobjs, inject_bg_rect=inject_bg_rect)
             except Exception as e:
                 print(f"[recolor] page failed: {e}")
 
