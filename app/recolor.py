@@ -419,13 +419,81 @@ def recolor_pdf(input_path: str, output_path: str, palette: dict = None, max_pag
     if palette:
         _set_palette(palette)
 
-    with pikepdf.open(input_path) as pdf:
-        visited_xobjs: set = set()
-        pages = list(pdf.pages)[:max_pages] if max_pages else pdf.pages
-        for page in pages:
-            try:
-                recolor_page_stream(page, pdf, visited_xobjs, inject_bg_rect=inject_bg_rect)
-            except Exception as e:
-                print(f"[recolor] page failed: {e}")
+def fast_regex_recolor(content: bytes, palette: dict, inject_bg_rect: bool = True, w: float = 0, h: float = 0) -> bytes:
+    import re
+    _set_palette(palette)
 
-        pdf.save(output_path, compress_streams=True)
+    # We must match standard numbers and scientific notation just in case, though standard numbers are 99%
+    # Float regex: \-?[0-9]*\.?[0-9]+
+    num_re = rb'\-?[0-9]*\.?[0-9]+'
+    
+    def replacer_rgb(m):
+        try:
+            r, g, b = float(m.group(1)), float(m.group(2)), float(m.group(3))
+            is_stroke = (m.group(4) == b'RG')
+            # in regex we don't safely track in_text across blocks reliably if BT/ET are complex, 
+            # so we use for_text=False which resolves properly for duotone text as well.
+            r2, g2, b2 = _map_rgb(r, g, b, for_text=False, for_stroke=is_stroke)
+            return f"{r2:.4f} {g2:.4f} {b2:.4f} {m.group(4).decode()}".encode()
+        except: return m.group(0)
+
+    # rgb matches: 1 1 1 rg
+    rgb_pat = rb'\b(' + num_re + rb')\s+(' + num_re + rb')\s+(' + num_re + rb')\s+(rg|RG)\b'
+    content = re.sub(rgb_pat, replacer_rgb, content)
+    
+    def replacer_g(m):
+        try:
+            g_val = float(m.group(1))
+            is_stroke = (m.group(2) == b'G')
+            r2, g2, b2 = _map_rgb(g_val, g_val, g_val, for_text=False, for_stroke=is_stroke)
+            op = b"RG" if is_stroke else b"rg"
+            return f"{r2:.4f} {g2:.4f} {b2:.4f} {op.decode()}".encode()
+        except: return m.group(0)
+
+    # grey matches: 1 g
+    g_pat = rb'\b(' + num_re + rb')\s+(g|G)\b'
+    content = re.sub(g_pat, replacer_g, content)
+    
+    def replacer_cmyk(m):
+        try:
+            c, m_val, y, k = float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))
+            is_stroke = (m.group(5) == b'K')
+            r = (1 - c) * (1 - k)
+            g_val = (1 - m_val) * (1 - k)
+            b = (1 - y) * (1 - k)
+            r2, g2, b2 = _map_rgb(r, g_val, b, for_text=False, for_stroke=is_stroke)
+            op = b"RG" if is_stroke else b"rg"
+            return f"{r2:.4f} {g2:.4f} {b2:.4f} {op.decode()}".encode()
+        except: return m.group(0)
+        
+    cmyk_pat = rb'\b(' + num_re + rb')\s+(' + num_re + rb')\s+(' + num_re + rb')\s+(' + num_re + rb')\s+(k|K)\b'
+    content = re.sub(cmyk_pat, replacer_cmyk, content)
+
+    # Inject BG rect
+    if inject_bg_rect and w > 0 and h > 0:
+        r, g_val, b = BG
+        bg_bytes = (
+            b"q\n"
+            + f"{r:.4f} {g_val:.4f} {b:.4f} rg\n".encode()
+            + f"0.00 0.00 {w:.2f} {h:.2f} re\n".encode()
+            + b"f\nQ\n"
+        )
+        content = bg_bytes + content
+
+    return content
+
+def recolor_pdf(input_path: str, output_path: str, palette: dict = None, max_pages: int = None, inject_bg_rect: bool = True) -> None:
+    import fitz
+    src = fitz.open(input_path)
+    pages = range(len(src)) if not max_pages else range(min(max_pages, len(src)))
+    for i in pages:
+        page = src[i]
+        content = page.read_contents()
+        w, h = page.rect.width, page.rect.height
+        new_content = fast_regex_recolor(content, palette, inject_bg_rect=inject_bg_rect, w=w, h=h)
+        xref = page.get_contents()[0] if page.get_contents() else 0
+        if xref:
+            src.update_stream(xref, new_content)
+            
+    src.save(output_path, deflate=True)
+    src.close()
