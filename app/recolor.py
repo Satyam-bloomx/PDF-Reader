@@ -243,10 +243,10 @@ def _recolor_image_xobj(xobj: pikepdf.Object) -> None:
         return
 
     # Downsample large decorative images before recoloring — saves time, no visible quality loss
-    max_dim = 1200
+    max_dim = 800
     if img.width > max_dim or img.height > max_dim:
         scale = max_dim / max(img.width, img.height)
-        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.BILINEAR)
 
     arr = np.array(img, dtype=np.float32) / 255.0
     out = _recolor_array(arr)
@@ -267,7 +267,7 @@ def _recolor_image_xobj(xobj: pikepdf.Object) -> None:
     xobj["/Height"] = out_img.height
 
 
-def _recolor_xobjects(resources: pikepdf.Object, _pdf: pikepdf.Pdf, visited: set) -> None:
+def _recolor_xobjects(resources: pikepdf.Object, _pdf: pikepdf.Pdf, visited: set, used_keys: set = None) -> None:
     """Recursively recolor all XObjects (Form + Image) in a resource dictionary."""
     if resources is None:
         return
@@ -275,6 +275,8 @@ def _recolor_xobjects(resources: pikepdf.Object, _pdf: pikepdf.Pdf, visited: set
     if xobj_dict is None:
         return
     for key in xobj_dict.keys():
+        if used_keys is not None and str(key) not in used_keys:
+            continue
         xobj = xobj_dict[key]
         objid = xobj.objgen  # use PDF object number — shared objects recolored once
         if objid in visited:
@@ -313,9 +315,13 @@ def recolor_page_stream(page: pikepdf.Page, pdf: pikepdf.Pdf, visited_xobjs: set
 
     instructions = []
     in_text = False  # track BT/ET text blocks
+    used_xobjs = set()  # track which XObjects are actually drawn
 
     for operands, operator in pikepdf.parse_content_stream(page):
         op = bytes(operator)
+
+        if op == b"Do" and len(operands) > 0 and isinstance(operands[0], pikepdf.Name):
+            used_xobjs.add(str(operands[0]))
 
         if op == b"BT":
             in_text = True
@@ -361,8 +367,8 @@ def recolor_page_stream(page: pikepdf.Page, pdf: pikepdf.Pdf, visited_xobjs: set
         else:
             instructions.append((operands, operator))
 
-    # Recolor all XObjects
-    _recolor_xobjects(resources, pdf, visited_xobjs)
+    # Recolor all XObjects that are actually drawn on the page
+    _recolor_xobjects(resources, pdf, visited_xobjs, used_keys=used_xobjs)
 
     recolored_bytes = pikepdf.unparse_content_stream(instructions)
 
