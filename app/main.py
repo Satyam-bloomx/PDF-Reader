@@ -14,11 +14,9 @@ import shutil
 import asyncio
 import traceback
 import tempfile
-import threading
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-_recolor_lock = threading.Lock()
 
 
 
@@ -1010,8 +1008,7 @@ def _render_preview_page_small(input_path: str, palette: dict) -> bytes:
         white_mask = ((orig_arr_i.min(axis=2) >= 200) & ((orig_arr_i.max(axis=2) - orig_arr_i.min(axis=2)) <= 30))[:,:,None]
 
         recolored_path = os.path.join(tmp, "recolored.pdf")
-        with _recolor_lock:
-            recolor_pdf(stripped, recolored_path, palette, max_pages=1)
+        recolor_pdf(stripped, recolored_path, palette, max_pages=1)
 
         doc = fitz.open(recolored_path)
         pix = doc[0].get_pixmap(matrix=mat, alpha=False)
@@ -1149,6 +1146,7 @@ def _make_template_page(out_doc, bg_img_pil, width_pt: float, height_pt: float, 
     page.insert_image(page.rect, stream=buf.read())
 
     # Overlay Hindi text using fitz TextWriter (correct Devanagari shaping)
+    import fitz as _fitz
     font_path = _find_deva_font_path()
     if not font_path:
         return
@@ -1161,11 +1159,10 @@ def _make_template_page(out_doc, bg_img_pil, width_pt: float, height_pt: float, 
     body_sz     = width_pt * 0.028
 
     try:
-        font = fitz.Font(fontfile=font_path)
+        font = _fitz.Font(fontfile=font_path)
     except Exception:
         return
 
-    writer = fitz.TextWriter(page.rect)
     y = height_pt * 0.30
 
     for text, kind in _HINDI_DUMMY_LINES:
@@ -1181,10 +1178,9 @@ def _make_template_page(out_doc, bg_img_pil, width_pt: float, height_pt: float, 
         except Exception:
             tw = width_pt * 0.5
         x = max(width_pt * 0.10, (width_pt - tw) / 2)
+        writer = _fitz.TextWriter(page.rect)
         writer.append((x, y), text, font=font, fontsize=fs)
-        # flush per line so each line can have its own color
         writer.write_text(page, color=color)
-        writer = fitz.TextWriter(page.rect)
         y += fs * (2.4 if kind == "title" else 1.9)
 
 
@@ -1250,9 +1246,8 @@ def _process_pdf_sync(input_path: str, output_path: str, original_filename: str,
         from .recolor import recolor_pdf
         print(f"[DEBUG] recoloring via pikepdf (small size)")
         recolored_tmp = input_path + ".recolored.pdf"
-        with _recolor_lock:
-            # Tell recolor_pdf NOT to inject the solid flat color bg if we have a custom bg
-            recolor_pdf(stripped_tmp, recolored_tmp, palette, inject_bg_rect=(custom_bg is None))
+        # Tell recolor_pdf NOT to inject the solid flat color bg if we have a custom bg
+        recolor_pdf(stripped_tmp, recolored_tmp, palette, inject_bg_rect=(custom_bg is None))
         
         # Now assemble with template pages and background image
         out_doc = fitz.open()
