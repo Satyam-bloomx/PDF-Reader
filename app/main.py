@@ -17,81 +17,9 @@ import tempfile
 import threading
 from pathlib import Path
 from contextlib import asynccontextmanager
-from concurrent.futures import ProcessPoolExecutor
 
 _recolor_lock = threading.Lock()
 
-
-def _render_page_worker(args):
-    """
-    Render one page to JPEG with background composite.
-    Must be a top-level function for ProcessPoolExecutor pickling.
-    All recolor logic is inlined — no app.* imports needed.
-    """
-    page_num, input_path, dpi, quality, bg_path, palette = args
-
-    import fitz
-    import numpy as np
-    import io as _io
-    from PIL import Image
-
-    # ── Inline recolor using passed palette ──────────────────────────────────
-    BG_c     = np.array(palette.get("bg",     (0.502, 0.027, 0.063)), dtype=np.float32)
-    TEXT_c   = np.array(palette.get("text",   (1.000, 0.980, 0.820)), dtype=np.float32)
-    GOLD_c   = np.array(palette.get("gold",   (1.000, 0.843, 0.353)), dtype=np.float32)
-    VIOLET_c = np.array(palette.get("violet", (1.000, 0.700, 0.400)), dtype=np.float32)
-    TEAL_c   = np.array(palette.get("teal",   (1.000, 0.900, 0.600)), dtype=np.float32)
-    CORAL_c  = np.array(palette.get("coral",  (1.000, 0.780, 0.580)), dtype=np.float32)
-
-    def recolor(arr_f):
-        r, g, b = arr_f[:,:,0], arr_f[:,:,1], arr_f[:,:,2]
-        mx = arr_f.max(axis=2); mn = arr_f.min(axis=2)
-        lum = 0.299*r + 0.587*g + 0.114*b
-        sat = (mx - mn) / (mx + 1e-6)
-        out = TEXT_c + lum[:,:,None] * (BG_c - TEXT_c)
-        color_mask = sat >= 0.4
-        if color_mask.any():
-            delta = mx - mn + 1e-6
-            hue = np.zeros(arr_f.shape[:2], dtype=np.float32)
-            mr, mgm, mbm = (mx==r), (mx==g), (mx==b)
-            hue[mr]  = ((g[mr]  - b[mr])  / delta[mr])  % 6
-            hue[mgm] = (b[mgm]  - r[mgm]) / delta[mgm]  + 2
-            hue[mbm] = (r[mbm]  - g[mbm]) / delta[mbm]  + 4
-            hue /= 6.0
-            warm  = (hue < 0.18) | (hue > 0.88)
-            green = (hue >= 0.18) & (hue < 0.55)
-            cool  = (hue >= 0.55) & (hue <= 0.85)
-            accent = np.where(warm[:,:,None], GOLD_c,
-                     np.where(green[:,:,None], TEAL_c,
-                     np.where(cool[:,:,None],  VIOLET_c, CORAL_c)))
-            mix = np.clip((sat - 0.4) / 0.6, 0, 1)[:,:,None]
-            grey = TEXT_c + lum[:,:,None] * (BG_c - TEXT_c)
-            out[color_mask] = ((1-mix)*grey + mix*accent)[color_mask]
-        return np.clip(out, 0, 1)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    src = fitz.open(input_path)
-    page = src[page_num]
-    pt_w, pt_h = page.rect.width, page.rect.height
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3).copy()
-    src.close()
-
-    # Compute white mask on ORIGINAL pixels (before recolor turns white → maroon)
-    arr_i = arr.astype(np.int16)
-    white_mask = ((arr_i.min(axis=2) >= 200) & ((arr_i.max(axis=2) - arr_i.min(axis=2)) <= 30))[:,:,None]
-
-    out_arr = (np.clip(recolor(arr.astype(np.float32) / 255.0), 0, 1) * 255).astype(np.uint8)
-
-    if bg_path:
-        bg_np = np.array(Image.open(bg_path).convert("RGB").resize(
-            (pix.width, pix.height), Image.BILINEAR), dtype=np.uint8)
-        out_arr = np.where(white_mask, bg_np, out_arr).astype(np.uint8)
-
-    buf = _io.BytesIO()
-    Image.fromarray(out_arr, "RGB").save(buf, format="JPEG", quality=quality, subsampling=0)
-    return (page_num, pt_w, pt_h, buf.getvalue())
 
 
 
@@ -99,7 +27,6 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTa
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 import io
 
-from .recolor import _recolor_array, _set_palette
 
 BASE_DIR = Path(__file__).parent.parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -498,23 +425,6 @@ async def index():
           <input type="color" id="coral-color" value="#ffc794">
         </div>
 
-        <div class="sec-ttl" style="margin-top:2px;">Output Mode</div>
-        <div class="mode-toggle-wrap">
-          <div class="mode-opt active" id="mode-quality" onclick="setMode('quality')">
-            <div class="mode-icon">&#x2605;</div>
-            <div class="mode-info">
-              <div class="mode-name">High Quality</div>
-              <div class="mode-desc">Ultra-sharp &bull; premium colors &bull; ~35MB</div>
-            </div>
-          </div>
-          <div class="mode-opt" id="mode-small" onclick="setMode('small')">
-            <div class="mode-icon">&#x26A1;</div>
-            <div class="mode-info">
-              <div class="mode-name">Small Size</div>
-              <div class="mode-desc">All colors &bull; works everywhere &bull; ~8MB</div>
-            </div>
-          </div>
-        </div>
 
         <button class="btn-main" id="beautify-btn" onclick="uploadFile()" disabled>&#x2736; &nbsp; Beautify PDF &nbsp; &#x2736;</button>
         <div id="status"></div>
@@ -766,13 +676,7 @@ async def index():
   document.getElementById('bg-op').addEventListener('input',updatePrev);
 
   // ══════════════ FILE UPLOAD ══════════════
-  let curJob=null, poll=null, currentMode='quality';
-  function setMode(m){
-    currentMode=m;
-    document.getElementById('mode-quality').classList.toggle('active', m==='quality');
-    document.getElementById('mode-small').classList.toggle('active', m==='small');
-    schedulePreview();
-  }
+  let curJob=null, poll=null, currentMode='small';
   const dz=document.getElementById('drop-zone'), fi=document.getElementById('file-input');
   const bBtn=document.getElementById('beautify-btn'), st=document.getElementById('status'), dlBtn=document.getElementById('dl-btn');
 
@@ -1026,7 +930,6 @@ async def preview_pdf(
     violet_color: str = Form("#ffb266"),
     teal_color: str = Form("#ffe699"),
     coral_color: str = Form("#ffc794"),
-    mode: str = Form("quality"),
 ):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted")
@@ -1040,7 +943,7 @@ async def preview_pdf(
         "coral":  hex_to_rgb(coral_color),
     }
 
-    render_fn = _render_preview_page if mode != "small" else _render_preview_page_small
+    render_fn = _render_preview_page_small
 
     with tempfile.TemporaryDirectory() as tmp:
         input_path = os.path.join(tmp, "input.pdf")
@@ -1060,40 +963,27 @@ async def preview_pdf(
     return StreamingResponse(io.BytesIO(png_bytes), media_type="image/png")
 
 
-def _render_preview_page(input_path: str, palette: dict) -> bytes:
-    """
-    Preview strategy: render the ORIGINAL PDF page with PyMuPDF (same engine as
-    Chrome — correct fonts, transparency, borders), then apply the palette color
-    transformation on the raw pixels using _recolor_array.
-    Fast (~1-2s), no pikepdf stream manipulation, visually identical to final output.
-    """
-    import fitz
-    import numpy as np
-    from PIL import Image
-    import io as _io
-
-    # 1. Render original page at 180 DPI — PyMuPDF reads it correctly like Chrome
+def _strip_bg_to_tmp(input_path: str, tmp_dir: str) -> str:
+    """Strip large background XObjects from page 0 and save to a temp file."""
+    import fitz, re as _re
     doc = fitz.open(input_path)
     page = doc[0]
-    mat = fitz.Matrix(180 / 72, 180 / 72)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
+    page_area = page.rect.width * page.rect.height
+    images = page.get_images(full=True)
+    names_to_remove = {img[7] for img in images if img[2] * img[3] > page_area * 0.5}
+    if names_to_remove:
+        content = page.read_contents().decode("latin-1")
+        for name in names_to_remove:
+            pattern = r"q\s[^q]*?/" + _re.escape(name) + r"\s+Do\s+Q\s+Q\s+"
+            content = _re.sub(pattern, "", content, flags=_re.DOTALL)
+        xref = page.get_contents()[0] if page.get_contents() else 0
+        if xref:
+            doc.update_stream(xref, content.encode("latin-1"))
+    stripped_path = os.path.join(tmp_dir, "stripped_preview.pdf")
+    doc.save(stripped_path)
     doc.close()
+    return stripped_path
 
-    # 2. Convert pixmap → float32 numpy array [0..1]
-    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-    arr = arr.astype(np.float32) / 255.0
-
-    # 3. Apply the exact same palette color mapping used on embedded images
-    with _recolor_lock:
-        _set_palette(palette)
-        recolored = _recolor_array(arr)
-
-    # 4. Encode result as PNG
-    out_arr = (np.clip(recolored, 0, 1) * 255).astype(np.uint8)
-    img = Image.fromarray(out_arr, "RGB")
-    buf = _io.BytesIO()
-    img.save(buf, format="PNG", optimize=False)
-    return buf.getvalue()
 
 
 def _render_preview_page_small(input_path: str, palette: dict) -> bytes:
@@ -1109,18 +999,37 @@ def _render_preview_page_small(input_path: str, palette: dict) -> bytes:
     from .recolor import recolor_pdf
 
     with tempfile.TemporaryDirectory() as tmp:
+        stripped = _strip_bg_to_tmp(input_path, tmp)
+
+        # Render stripped (pre-recolor) page to get white_mask before colors change
+        doc_orig = fitz.open(stripped)
+        mat = fitz.Matrix(180 / 72, 180 / 72)
+        pix_orig = doc_orig[0].get_pixmap(matrix=mat, alpha=False)
+        doc_orig.close()
+        orig_arr_i = np.frombuffer(pix_orig.samples, dtype=np.uint8).reshape(pix_orig.height, pix_orig.width, 3).astype(np.int16)
+        white_mask = ((orig_arr_i.min(axis=2) >= 200) & ((orig_arr_i.max(axis=2) - orig_arr_i.min(axis=2)) <= 30))[:,:,None]
+
         recolored_path = os.path.join(tmp, "recolored.pdf")
         with _recolor_lock:
-            recolor_pdf(input_path, recolored_path, palette, max_pages=1)
+            recolor_pdf(stripped, recolored_path, palette, max_pages=1)
 
         doc = fitz.open(recolored_path)
-        page = doc[0]
-        mat = fitz.Matrix(180 / 72, 180 / 72)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
+        pix = doc[0].get_pixmap(matrix=mat, alpha=False)
         doc.close()
 
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-    img = Image.fromarray(arr, "RGB")
+    out_arr = arr.copy()
+
+    if BG_TEMPLATE_PATH.exists():
+        bg_c = palette.get("bg", (0.502, 0.027, 0.063))
+        fill_color = tuple(int(c * 255) for c in bg_c)
+        bg_rgba = Image.open(str(BG_TEMPLATE_PATH)).convert("RGBA").resize((pix.width, pix.height), Image.BILINEAR)
+        canvas = Image.new("RGB", (pix.width, pix.height), fill_color)
+        canvas.paste(bg_rgba, mask=bg_rgba.split()[3])
+        bg_np = np.array(canvas, dtype=np.uint8)
+        out_arr = np.where(white_mask, bg_np, out_arr).astype(np.uint8)
+
+    img = Image.fromarray(out_arr, "RGB")
     buf = _io.BytesIO()
     img.save(buf, format="PNG", optimize=False)
     return buf.getvalue()
@@ -1191,17 +1100,92 @@ BG_TEMPLATE_PATH = BASE_DIR / "app" / "assets" / "bg_template.png"
 TEMPLATE_PAGE_POSITIONS = [0, 2, 3]  # start, 3rd place, 4th place (end added automatically)
 
 
-def _make_template_page(out_doc, bg_img_pil, width_pt: float, height_pt: float):
+_HINDI_DUMMY_LINES = [
+    ("ॐ नमः शिवाय",                              "title"),
+    ("जन्म कुंडली एवं ग्रह विवरण",               "subtitle"),
+    ("राशि फल — ग्रह, नक्षत्र एवं भाव",         "body"),
+    ("आपका भविष्य, आपकी शक्ति",                  "body"),
+    ("ज्योतिष शास्त्र — प्राचीन ज्ञान का प्रकाश", "body"),
+    ("सूर्य • चन्द्र • मंगल • बुध • गुरु • शुक्र • शनि", "body"),
+    ("लग्न कुंडली — नवग्रह स्थिति",              "body"),
+    ("दशा — अन्तर्दशा — विंशोत्तरी",             "body"),
+]
+
+_DEVA_FONT_PATHS = [
+    r"C:\Windows\Fonts\NirmalaUI.ttf",
+    r"C:\Windows\Fonts\NirmalaUIB.ttf",
+    r"C:\Windows\Fonts\mangal.ttf",
+    r"C:\Windows\Fonts\Aparajita.ttf",
+    "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+]
+
+_deva_font_path_cache = None
+
+def _find_deva_font_path():
+    global _deva_font_path_cache
+    if _deva_font_path_cache is not None:
+        return _deva_font_path_cache
+    for p in _DEVA_FONT_PATHS:
+        if os.path.exists(p):
+            _deva_font_path_cache = p
+            return p
+    return None
+
+
+def _make_template_page(out_doc, bg_img_pil, width_pt: float, height_pt: float, bg_color=(255, 255, 255)):
     """Insert a full-bleed template page (background design only, no content)."""
     import io as _io
+    import fitz
+    from PIL import Image
     buf = _io.BytesIO()
-    bg_resized = bg_img_pil.convert("RGB").resize(
-        (int(width_pt * 200 / 72), int(height_pt * 200 / 72)), 1  # LANCZOS=1
-    )
-    bg_resized.save(buf, format="JPEG", quality=95)
+    px_w, px_h = int(width_pt * 200 / 72), int(height_pt * 200 / 72)
+    bg_rgba = bg_img_pil.convert("RGBA").resize((px_w, px_h), 1)  # LANCZOS=1
+    canvas = Image.new("RGB", (px_w, px_h), bg_color)
+    canvas.paste(bg_rgba, mask=bg_rgba.split()[3])
+    canvas.save(buf, format="JPEG", quality=95)
     buf.seek(0)
     page = out_doc.new_page(width=width_pt, height=height_pt)
     page.insert_image(page.rect, stream=buf.read())
+
+    # Overlay Hindi text using fitz TextWriter (correct Devanagari shaping)
+    font_path = _find_deva_font_path()
+    if not font_path:
+        return
+
+    gold   = (1.0, 0.847, 0.353)
+    silver = (0.820, 0.827, 0.855)
+
+    title_sz    = width_pt * 0.060
+    subtitle_sz = width_pt * 0.036
+    body_sz     = width_pt * 0.028
+
+    try:
+        font = fitz.Font(fontfile=font_path)
+    except Exception:
+        return
+
+    writer = fitz.TextWriter(page.rect)
+    y = height_pt * 0.30
+
+    for text, kind in _HINDI_DUMMY_LINES:
+        if kind == "title":
+            fs, color = title_sz, gold
+        elif kind == "subtitle":
+            fs, color = subtitle_sz, silver
+        else:
+            fs, color = body_sz, silver
+
+        try:
+            tw = font.text_length(text, fontsize=fs)
+        except Exception:
+            tw = width_pt * 0.5
+        x = max(width_pt * 0.10, (width_pt - tw) / 2)
+        writer.append((x, y), text, font=font, fontsize=fs)
+        # flush per line so each line can have its own color
+        writer.write_text(page, color=color)
+        writer = fitz.TextWriter(page.rect)
+        y += fs * (2.4 if kind == "title" else 1.9)
 
 
 def _process_pdf_sync(input_path: str, output_path: str, original_filename: str, palette: dict, mode: str = "quality"):
@@ -1275,16 +1259,19 @@ def _process_pdf_sync(input_path: str, output_path: str, original_filename: str,
         src_recolored = fitz.open(recolored_tmp)
         ref_w, ref_h = src_recolored[0].rect.width, src_recolored[0].rect.height
         
+        _pal_bg = palette.get("bg", (0.502, 0.027, 0.063))
+        _bg_color = tuple(int(c * 255) for c in _pal_bg)
+
         def insert_template(position_label: str):
             if custom_bg is not None:
-                _make_template_page(out_doc, custom_bg, ref_w, ref_h)
+                _make_template_page(out_doc, custom_bg, ref_w, ref_h, _bg_color)
                 print(f"[DEBUG] inserted template page at {position_label} (small mode)")
 
         # Prepare 1-page document with just background for overlay
         bg_doc = None
         if custom_bg is not None:
             bg_doc = fitz.open()
-            _make_template_page(bg_doc, custom_bg, ref_w, ref_h)
+            _make_template_page(bg_doc, custom_bg, ref_w, ref_h, _bg_color)
 
         insert_template("start")
         for i in range(len(src_recolored)):
@@ -1315,55 +1302,6 @@ def _process_pdf_sync(input_path: str, output_path: str, original_filename: str,
         print("[DEBUG] done")
         return
 
-    # --- High Quality Mode ---
-    # 200 DPI: sharp text, subsampling=0 removes chroma blur
-    # Quality 72: compensates for higher DPI to keep file size reasonable
-    DPI, QUALITY = 180, 80
-    print(f"[DEBUG] recoloring via PyMuPDF pixel render (high quality)")
-
-    bg_path_str = str(BG_TEMPLATE_PATH) if BG_TEMPLATE_PATH.exists() else None
-    num_pages = len(fitz.open(stripped_tmp))
-    args_list = [
-        (i, stripped_tmp, DPI, QUALITY, bg_path_str, palette)
-        for i in range(num_pages)
-    ]
-
-    t_render_start = time.time()
-    with ProcessPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(_render_page_worker, args_list))
-    results.sort(key=lambda x: x[0])
-    content_pages = [(w, h, j) for _, w, h, j in results]
-    print(f"[TIMING] render+composite: {time.time() - t_render_start:.1f}s for {num_pages} pages")
-
-    try:
-        os.remove(stripped_tmp)
-    except Exception:
-        pass
-
-    # Second pass: assemble final document
-    ref_w, ref_h = content_pages[0][0], content_pages[0][1]
-    out_doc = fitz.open()
-
-    def insert_template(position_label: str):
-        if custom_bg is not None:
-            _make_template_page(out_doc, custom_bg, ref_w, ref_h)
-            print(f"[DEBUG] inserted template page at {position_label}")
-
-    def insert_content_page(w, h, jpeg_bytes):
-        p = out_doc.new_page(width=w, height=h)
-        p.insert_image(p.rect, stream=jpeg_bytes)
-
-    # Build final page order:
-    insert_template("start")
-    for i, (w, h, png) in enumerate(content_pages):
-        if i == 1:
-            insert_template("3rd place")
-            insert_template("4th place")
-        insert_content_page(w, h, png)
-    insert_template("end")
-
-    out_doc.save(output_path, deflate=True, garbage=4)
-    out_doc.close()
 
     print(f"[TIMING] total: {time.time() - t_total_start:.1f}s")
     print("[DEBUG] done")
