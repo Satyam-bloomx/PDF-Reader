@@ -32,6 +32,8 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+_process_semaphore = asyncio.Semaphore(6)  # max 6 PDFs processing concurrently
+
 async def cleanup_jobs():
     while True:
         try:
@@ -801,6 +803,8 @@ async def index():
         const d=await r.json();
         if(d.status==='done'){clearInterval(poll);showSt('done','\u2736 Your celestial PDF is ready!');dlBtn.style.display='block';bBtn.disabled=false;boom();}
         else if(d.status==='error'){clearInterval(poll);showSt('error','\u2715 '+(d.error||'Processing failed'));bBtn.disabled=false;}
+        else if(d.status==='queued'){showSt('processing','\u23F3 Queued \u2014 waiting for a processing slot\u2026');}
+        else if(d.status==='processing'){showSt('processing','\u2736 Processing your PDF\u2026');}
       }catch(e){clearInterval(poll);showSt('error','\u2715 Connection lost');bBtn.disabled=false;}
     },2000);
   }
@@ -1047,7 +1051,7 @@ async def upload_pdf(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted")
 
-    active_jobs = sum(1 for j in jobs.values() if j["status"] in ("pending", "processing"))
+    active_jobs = sum(1 for j in jobs.values() if j["status"] in ("queued", "processing"))
     if active_jobs >= 15:
         raise HTTPException(status_code=429, detail="Max 15 PDFs allowed at a time. Please wait for current jobs to finish.")
 
@@ -1068,7 +1072,7 @@ async def upload_pdf(
     }
 
     jobs[job_id] = {
-        "status": "processing",
+        "status": "queued",
         "input": str(input_path),
         "output": str(output_path),
         "timestamp": time.time()
@@ -1076,18 +1080,20 @@ async def upload_pdf(
 
     background_tasks.add_task(_process_pdf, job_id, str(input_path), str(output_path), file.filename, palette, mode)
 
-    return {"job_id": job_id, "status": "processing"}
+    return {"job_id": job_id, "status": "queued"}
 
 
 async def _process_pdf(job_id: str, input_path: str, output_path: str, original_filename: str, palette: dict, mode: str = "quality"):
     loop = asyncio.get_running_loop()
-    try:
-        await loop.run_in_executor(None, _process_pdf_sync, input_path, output_path, original_filename, palette, mode)
-        jobs[job_id]["status"] = "done"
-    except Exception as e:
-        jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"] = str(e)
-        traceback.print_exc()
+    async with _process_semaphore:
+        jobs[job_id]["status"] = "processing"
+        try:
+            await loop.run_in_executor(None, _process_pdf_sync, input_path, output_path, original_filename, palette, mode)
+            jobs[job_id]["status"] = "done"
+        except Exception as e:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = str(e)
+            traceback.print_exc()
 
 
 # Hardcoded background template path — place your design here
